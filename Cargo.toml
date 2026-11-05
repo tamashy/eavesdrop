@@ -1,0 +1,29 @@
+[package]
+name = "eavesdrop"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+clap = { version = "4", features = ["derive"] }
+cpal = "0.18.2"
+ctrlc = "3.5.2"
+dirs = "7.0.0"
+hound = "3.5.1"
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.0"
+
+# On Linux use the PulseAudio backend (also works on PipeWire via pipewire-pulse),
+# which exposes "<sink>.monitor" sources for recording what plays through the speakers.
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "0.18.2", features = ["pulseaudio"] }
+
+# Used to keep the console window open when started by double-click in Explorer.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+
+[profile.release]
+lto = true
+strip = true

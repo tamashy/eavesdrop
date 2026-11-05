@@ -1,0 +1,66 @@
+version: '3'
+
+vars:
+  BIN: eavesdrop{{exeExt}}
+  PREFIX: '{{.PREFIX | default (printf "%s/.local" .HOME)}}'
+
+tasks:
+  default:
+    desc: Optimized build (same as `task release`)
+    cmds:
+      - task: release
+
+  build:
+    desc: Debug build (target/debug/eavesdrop)
+    cmds:
+      - cargo build
+
+  release:
+    desc: Optimized build (target/release/eavesdrop)
+    cmds:
+      - cargo build --release
+
+  run:
+    desc: 'Run debug build, pass args after --, e.g. task run -- --list'
+    cmds:
+      - cargo run -- {{.CLI_ARGS}}
+
+  test:
+    desc: Run unit tests
+    cmds:
+      - cargo test
+
+  check:
+    desc: Type-check without building
+    cmds:
+      - cargo check
+
+  fmt:
+    desc: Format the code
+    cmds:
+      - cargo fmt
+
+  lint:
+    desc: Run clippy, warnings as errors
+    cmds:
+      - cargo clippy --all-targets -- -D warnings
+
+  install:
+    desc: Install to PREFIX/bin (default ~/.local/bin), e.g. task install PREFIX=/usr/local
+    deps: [release]
+    platforms: [darwin, linux]
+    cmds:
+      - install -d "{{.PREFIX}}/bin"
+      - install -m 755 "target/release/{{.BIN}}" "{{.PREFIX}}/bin/{{.BIN}}"
+      - echo "Installed {{.PREFIX}}/bin/{{.BIN}}"
+
+  uninstall:
+    desc: Remove the installed binary
+    platforms: [darwin, linux]
+    cmds:
+      - rm -f "{{.PREFIX}}/bin/{{.BIN}}"
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - cargo clean
