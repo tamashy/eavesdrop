@@ -1,0 +1,145 @@
+name: Build
+
+# Every push / PR: build + test on all platforms, binaries uploaded as workflow artifacts.
+# Tags "v*" (e.g. v0.1.0): additionally publish a GitHub Release with the binaries.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on the oldest supported Ubuntu so the binary runs on older glibc too.
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - name: linux-aarch64
+            os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            cross: true
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - name: windows-aarch64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+            cross: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
+
+      - name: Test
+        if: ${{ !matrix.cross }}
+        run: cargo test --locked --target ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Check Windows binary has no VC++ runtime dependency
+        if: runner.os == 'Windows' && !matrix.cross
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          $deps = & $dumpbin.FullName /dependents "target\${{ matrix.target }}\release\eavesdrop.exe"
+          $deps
+          if ($deps -match 'VCRUNTIME|MSVCP|api-ms-win-crt') { throw "binary depends on the VC++ runtime" }
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: target/${{ matrix.target }}/release/eavesdrop${{ runner.os == 'Windows' && '.exe' || '' }}
+          if-no-files-found: error
+
+  package:
+    name: Package
+    needs: build
+    runs-on: macos-latest # for lipo / codesign
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: bin
+
+      - name: Package
+        run: |
+          set -eux
+          mkdir dist
+
+          # macOS: one universal binary (Apple Silicon + Intel), ad-hoc signed.
+          lipo -create bin/macos-aarch64/eavesdrop bin/macos-x86_64/eavesdrop -output eavesdrop
+          chmod +x eavesdrop
+          codesign --force --sign - eavesdrop
+          lipo -info eavesdrop
+          tar czf dist/eavesdrop-macos-universal.tar.gz eavesdrop
+          rm eavesdrop
+
+          for arch in x86_64 aarch64; do
+            cp bin/linux-$arch/eavesdrop eavesdrop && chmod +x eavesdrop
+            tar czf dist/eavesdrop-linux-$arch.tar.gz eavesdrop
+            rm eavesdrop
+            cp bin/windows-$arch/eavesdrop.exe eavesdrop.exe
+            zip -9 dist/eavesdrop-windows-$arch.zip eavesdrop.exe
+            rm eavesdrop.exe
+          done
+
+          cd dist && shasum -a 256 * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eavesdrop-all-platforms
+          path: dist/*
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: eavesdrop-all-platforms
+          path: dist
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "eavesdrop $GITHUB_REF_NAME" \
+            --generate-notes
