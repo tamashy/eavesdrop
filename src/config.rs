@@ -6,7 +6,7 @@
 //!
 //! ```toml
 //! # Folder where recordings are saved. `~` expands to your home directory.
-//! output_dir = "~/Documents/Calls"
+//! output_dir = "~/Documents/Recordings"
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -89,11 +89,8 @@ mod tests {
 
     #[test]
     fn tilde_expands() {
-        let cfg = Config::parse(r#"output_dir = "~/Calls""#).unwrap();
-        assert_eq!(
-            cfg.output_dir,
-            Some(dirs::home_dir().unwrap().join("Calls"))
-        );
+        let cfg = Config::parse(r#"output_dir = "~/Recs""#).unwrap();
+        assert_eq!(cfg.output_dir, Some(dirs::home_dir().unwrap().join("Recs")));
     }
 
     #[test]

@@ -5,7 +5,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+
+use crate::meta;
 
 pub struct Recording {
     pub path: PathBuf,
@@ -14,6 +16,15 @@ pub struct Recording {
     pub size: u64,
     /// None if the WAV header can't be read (e.g. still being written).
     pub duration: Option<Duration>,
+    /// What the recording is about (from its `.meta.toml`), empty if none.
+    pub description: String,
+}
+
+impl Recording {
+    /// First line of the description.
+    pub fn summary(&self) -> &str {
+        self.description.lines().next().unwrap_or("")
+    }
 }
 
 /// WAV files directly in `dir`, newest first. A missing folder yields an empty list.
@@ -41,6 +52,7 @@ pub fn scan(dir: &Path) -> Result<Vec<Recording>> {
                 modified: meta.as_ref().and_then(|m| m.modified().ok()),
                 size: meta.map(|m| m.len()).unwrap_or(0),
                 duration: wav_duration(&path),
+                description: meta::load(&path).map(|m| m.description).unwrap_or_default(),
                 path,
             }
         })
@@ -57,6 +69,87 @@ fn wav_duration(path: &Path) -> Option<Duration> {
     let r = hound::WavReader::open(path).ok()?;
     let rate = r.spec().sample_rate;
     (rate > 0).then(|| Duration::from_secs_f64(r.duration() as f64 / rate as f64))
+}
+
+/// Characters not allowed in file names on at least one supported OS.
+const FORBIDDEN: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+
+/// Checks a new name typed by the user; returns it trimmed and without `.wav`.
+pub fn validate_name(name: &str) -> Result<String> {
+    let name = name.trim();
+    let name = match name.len().checked_sub(4) {
+        Some(i) if name.is_char_boundary(i) && name[i..].eq_ignore_ascii_case(".wav") => {
+            name[..i].trim_end()
+        }
+        _ => name,
+    };
+    if name.is_empty() {
+        bail!("name can't be empty");
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| FORBIDDEN.contains(c) || c.is_control())
+    {
+        bail!("name can't contain {c:?}");
+    }
+    if name.starts_with('.') || name.ends_with('.') {
+        bail!("name can't start or end with a dot");
+    }
+    Ok(name.to_string())
+}
+
+/// Renames a recording (and its metadata file) within its folder. Returns the new path.
+pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf> {
+    let name = validate_name(new_name)?;
+    let dest = path.with_file_name(format!("{name}.wav"));
+    if dest == path {
+        return Ok(dest);
+    }
+    // On case-insensitive file systems a case-only rename "exists" already.
+    let same_file = dest.to_string_lossy().to_lowercase() == path.to_string_lossy().to_lowercase();
+    if dest.exists() && !same_file {
+        bail!("{name}.wav already exists");
+    }
+    std::fs::rename(path, &dest).with_context(|| format!("cannot rename to {}", dest.display()))?;
+    let (old_meta, new_meta) = (meta::path_for(path), meta::path_for(&dest));
+    if old_meta.exists() {
+        std::fs::rename(&old_meta, &new_meta)
+            .with_context(|| format!("renamed recording, but not {}", old_meta.display()))?;
+    }
+    Ok(dest)
+}
+
+/// The recording and its metadata file, if any.
+fn files_of(path: &Path) -> Vec<PathBuf> {
+    let mut files = vec![path.to_path_buf()];
+    let m = meta::path_for(path);
+    if m.exists() {
+        files.push(m);
+    }
+    files
+}
+
+/// Moves a recording (and its metadata) to the system Trash / Recycle Bin.
+pub fn trash(path: &Path) -> Result<()> {
+    #[allow(unused_mut)]
+    let mut ctx = trash::TrashContext::default();
+    // macOS: the default asks Finder via AppleScript, which is slow and can block on
+    // an "allow to control Finder" prompt; the system call needs no permission.
+    #[cfg(target_os = "macos")]
+    {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        ctx.set_delete_method(DeleteMethod::NsFileManager);
+    }
+    ctx.delete_all(files_of(path))
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Deletes a recording (and its metadata) permanently.
+pub fn delete(path: &Path) -> Result<()> {
+    for f in files_of(path) {
+        std::fs::remove_file(&f).with_context(|| format!("cannot delete {}", f.display()))?;
+    }
+    Ok(())
 }
 
 pub fn fmt_modified(t: Option<SystemTime>) -> String {
@@ -82,6 +175,44 @@ mod tests {
     }
 
     #[test]
+    fn name_validation() {
+        assert_eq!(
+            validate_name("  Standup 2026.WAV ").unwrap(),
+            "Standup 2026"
+        );
+        assert_eq!(
+            validate_name("Встреча с командой").unwrap(),
+            "Встреча с командой"
+        );
+        for bad in [
+            "", "  ", ".wav", "a/b", "a\\b", "x:y", "q?", ".hidden", "end.",
+        ] {
+            assert!(validate_name(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rename_moves_metadata_and_refuses_overwrite() {
+        let dir = std::env::temp_dir().join(format!("eavesdrop-ren-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.wav");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(dir.join("taken.wav"), b"y").unwrap();
+        meta::set_description(&a, "about a").unwrap();
+
+        assert!(rename(&a, "taken").is_err());
+        let b = rename(&a, "Planning notes").unwrap();
+        assert_eq!(b, dir.join("Planning notes.wav"));
+        assert!(!a.exists() && b.exists());
+        assert_eq!(meta::load(&b).unwrap().description, "about a");
+        assert!(!meta::path_for(&a).exists());
+
+        delete(&b).unwrap();
+        assert!(!b.exists() && !meta::path_for(&b).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn lists_only_wav_with_duration() {
         let dir = std::env::temp_dir().join(format!("eavesdrop-lib-{}", std::process::id()));
         std::fs::create_dir_all(dir.join(".tmp-x")).unwrap();
@@ -102,6 +233,11 @@ mod tests {
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].name, "a.wav");
         assert_eq!(recs[0].duration, Some(Duration::from_millis(2500)));
+        assert_eq!(recs[0].description, "");
+        meta::set_description(&dir.join("a.wav"), "Line one\nline two").unwrap();
+        let recs = scan(&dir).unwrap();
+        assert_eq!(recs.len(), 1, "metadata file must not be listed");
+        assert_eq!(recs[0].summary(), "Line one");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

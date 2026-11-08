@@ -24,8 +24,9 @@ use ratatui::{
 
 use crate::{
     Meter,
-    browser::Library,
+    browser::{self, Library},
     clock::State,
+    input::{self, Action, TextInput},
     record::{Outcome, Recorder, Saving, Take},
 };
 
@@ -40,6 +41,8 @@ pub struct Config {
     pub limit: Option<Duration>,
     /// Start the first recording right away.
     pub start_now: bool,
+    /// Description for the first recording (`--about`).
+    pub about: String,
     /// Fires on SIGINT (only relevant if raw mode didn't catch Ctrl+C).
     pub stop: mpsc::Receiver<()>,
 }
@@ -146,7 +149,7 @@ enum View {
 /// The current take with its UI state.
 struct Live {
     take: Take,
-    call: Channel,
+    system: Channel,
     mic: Option<Channel>,
 }
 
@@ -162,10 +165,14 @@ struct App {
     saving: Vec<Saving>,
     /// Result of the last save, shown on the Record view.
     notes: Vec<(Color, String)>,
+    /// Description of the current recording, saved with it.
+    about: String,
+    /// Editor for `about` while open.
+    about_edit: Option<TextInput>,
 }
 
 impl App {
-    fn new(rec: Recorder, limit: Option<Duration>) -> Result<Self> {
+    fn new(rec: Recorder, limit: Option<Duration>, about: String) -> Result<Self> {
         let library = Library::new(rec.out_dir.clone())?;
         let mut app = Self {
             rec,
@@ -176,6 +183,8 @@ impl App {
             view: View::Record,
             saving: Vec::new(),
             notes: Vec::new(),
+            about,
+            about_edit: None,
         };
         app.open_take();
         Ok(app)
@@ -184,12 +193,12 @@ impl App {
     fn open_take(&mut self) {
         match self.rec.new_take() {
             Ok(take) => {
-                let call = Channel::new((self.rec.call.name.clone(), take.call.clone()));
+                let system = Channel::new((self.rec.system.name.clone(), take.system.clone()));
                 let mic = match (&self.rec.mic, &take.mic) {
                     (Some(i), Some(m)) => Some(Channel::new((i.name.clone(), m.clone()))),
                     _ => None,
                 };
-                self.live = Some(Live { take, call, mic });
+                self.live = Some(Live { take, system, mic });
                 self.open_error = None;
             }
             Err(e) => self.open_error = Some(format!("{e:#}")),
@@ -215,7 +224,8 @@ impl App {
     fn stop_and_save(&mut self) {
         let Some(live) = self.live.take() else { return };
         let name = live.take.output_path();
-        self.saving.push(live.take.stop());
+        self.saving
+            .push(live.take.stop(std::mem::take(&mut self.about)));
         self.notes = vec![(
             Color::Yellow,
             format!(
@@ -273,7 +283,7 @@ impl App {
 
     fn tick(&mut self, now: Instant) {
         if let Some(live) = self.live.as_mut() {
-            live.call.tick(now);
+            live.system.tick(now);
             if let Some(m) = live.mic.as_mut() {
                 m.tick(now);
             }
@@ -288,7 +298,39 @@ impl App {
     }
 
     /// Returns false to quit.
+    fn handle_event(&mut self, ev: Event) -> bool {
+        match ev {
+            Event::Paste(s) => {
+                if let Some(ed) = &mut self.about_edit {
+                    ed.insert_str(&s);
+                } else if self.view == View::Recordings {
+                    self.library.paste(&s);
+                }
+                true
+            }
+            Event::Key(k) if k.kind == KeyEventKind::Press => self.handle_key(k),
+            _ => true,
+        }
+    }
+
+    /// Returns false to quit.
     fn handle_key(&mut self, k: KeyEvent) -> bool {
+        // Open dialogs get every key, so typing "q" or Tab doesn't quit / switch.
+        if let Some(ed) = &mut self.about_edit {
+            match ed.handle_key(k) {
+                Action::None => {}
+                Action::Cancel => self.about_edit = None,
+                Action::Submit => {
+                    self.about = ed.text().trim_end().to_string();
+                    self.about_edit = None;
+                }
+            }
+            return true;
+        }
+        if self.view == View::Recordings && self.library.modal_open() {
+            self.library.handle_key(k);
+            return true;
+        }
         match k.code {
             KeyCode::Char('q') => return false,
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return false,
@@ -315,6 +357,7 @@ impl App {
                         m.meter.muted.fetch_xor(true, Ordering::Relaxed);
                     }
                 }
+                KeyCode::Char('e') => self.about_edit = Some(TextInput::new(&self.about, true)),
                 _ => {}
             },
             View::Recordings => match k.code {
@@ -331,7 +374,7 @@ impl App {
     /// Stops the current take (saving it if it was started) and returns all pending saves.
     fn finish(mut self) -> Vec<Saving> {
         if let Some(live) = self.live.take() {
-            self.saving.push(live.take.stop());
+            self.saving.push(live.take.stop(self.about));
         }
         self.saving
     }
@@ -344,14 +387,15 @@ pub fn run(cfg: Config) -> Result<Vec<Saving>> {
         recorder,
         limit,
         start_now,
+        about,
         stop,
     } = cfg;
-    let mut app = App::new(recorder, limit)?;
+    let mut app = App::new(recorder, limit, about)?;
     if start_now {
         app.toggle_recording();
     }
 
-    let mut terminal = ratatui::init();
+    let mut terminal = init_terminal();
     let result = (|| -> Result<()> {
         let mut last_tick = Instant::now() - TICK;
         loop {
@@ -365,15 +409,13 @@ pub fn run(cfg: Config) -> Result<Vec<Saving>> {
                 return Ok(());
             }
             if event::poll(TICK.saturating_sub(last_tick.elapsed()))?
-                && let Event::Key(k) = event::read()?
-                && k.kind == KeyEventKind::Press
-                && !app.handle_key(k)
+                && !app.handle_event(event::read()?)
             {
                 return Ok(());
             }
         }
     })();
-    ratatui::restore();
+    restore_terminal();
     let pending = app.finish();
     result.map(|()| pending)
 }
@@ -430,6 +472,38 @@ fn draw(f: &mut Frame, app: &mut App) {
         View::Record => draw_record(f, body, app),
         View::Recordings => app.library.draw(f, body),
     }
+    if let Some(ed) = &mut app.about_edit {
+        input::draw_input(
+            f,
+            body,
+            "About this recording".into(),
+            vec![
+                Line::from("What is this recording about? Topic, people, key points…").dim(),
+                Line::from("Saved next to the recording when it's saved.").dim(),
+            ],
+            ed,
+            8,
+            browser::describe_hint(ed),
+        );
+    }
+}
+
+/// Like `ratatui::init`, plus bracketed paste (so pasted text arrives in one piece).
+pub fn init_terminal() -> ratatui::DefaultTerminal {
+    let t = ratatui::init();
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::EnableBracketedPaste
+    );
+    t
+}
+
+pub fn restore_terminal() {
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::DisableBracketedPaste
+    );
+    ratatui::restore();
 }
 
 fn draw_record(f: &mut Frame, area: Rect, app: &App) {
@@ -446,20 +520,20 @@ fn draw_record(f: &mut Frame, area: Rect, app: &App) {
         return;
     };
     let clock = &live.take.clock;
-    let (call, mic) = (&live.call, live.mic.as_ref());
+    let (system, mic) = (&live.system, live.mic.as_ref());
     let limit = app.limit;
     let state = clock.state();
     let recorded = clock.recorded();
     // Warnings look at how long the devices have been open, so problems show up
     // while still in the ready state, before anything is recorded.
-    let mut warnings = collect_warnings(clock.origin().elapsed(), call, mic);
+    let mut warnings = collect_warnings(clock.origin().elapsed(), system, mic);
     warnings.extend(app.notes.iter().cloned());
 
-    let [header, call_area, mic_area, info, warn_area, footer] = Layout::vertical([
+    let [header, system_area, mic_area, info, warn_area, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(6),
         Constraint::Length(6),
-        Constraint::Length(4),
+        Constraint::Length(5),
         Constraint::Min(0),
         Constraint::Length(1),
     ])
@@ -496,11 +570,11 @@ fn draw_record(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Line::from(spans), header);
 
     // ---- channels ----------------------------------------------------------
-    draw_channel(f, call_area, "Call audio", Some(call));
+    draw_channel(f, system_area, "System audio", Some(system));
     draw_channel(f, mic_area, "Microphone", mic);
 
     // ---- info --------------------------------------------------------------
-    let bytes = call.meter.bytes.load(Ordering::Relaxed)
+    let bytes = system.meter.bytes.load(Ordering::Relaxed)
         + mic
             .map(|m| m.meter.bytes.load(Ordering::Relaxed))
             .unwrap_or(0);
@@ -520,6 +594,22 @@ fn draw_record(f: &mut Frame, area: Rect, app: &App) {
             Span::raw(fmt_bytes(bytes)),
             Span::raw(" (raw tracks)").dim(),
         ]),
+        match app.about.lines().next() {
+            Some(first) => Line::from(vec![
+                Span::raw("About      ").dim(),
+                Span::raw(first.to_string()).fg(Color::Cyan),
+                Span::raw(if app.about.lines().count() > 1 {
+                    " …"
+                } else {
+                    ""
+                })
+                .dim(),
+            ]),
+            None => Line::from(vec![
+                Span::raw("About      ").dim(),
+                Span::raw("press e to note what this recording is about").dim(),
+            ]),
+        },
     ];
     f.render_widget(
         Paragraph::new(info_text).block(
@@ -564,6 +654,8 @@ fn draw_record(f: &mut Frame, area: Rect, app: &App) {
         }));
     }
     footer_spans.extend([
+        key("e"),
+        Span::raw(" about   "),
         key("tab"),
         Span::raw(" recordings   "),
         key("q"),
@@ -583,7 +675,7 @@ fn draw_channel(f: &mut Frame, area: Rect, label: &str, ch: Option<&Channel>) {
             .border_style(Style::new().dim())
             .title(format!(" {label} · off "));
         f.render_widget(
-            Paragraph::new("No microphone — recording call audio only")
+            Paragraph::new("No microphone — recording system audio only")
                 .dim()
                 .block(block),
             area,
@@ -646,32 +738,32 @@ fn draw_channel(f: &mut Frame, area: Rect, label: &str, ch: Option<&Channel>) {
 
 fn collect_warnings(
     elapsed: Duration,
-    call: &Channel,
+    system: &Channel,
     mic: Option<&Channel>,
 ) -> Vec<(Color, String)> {
     let mut w = Vec::new();
-    for (label, ch) in [("Call audio", Some(call)), ("Microphone", mic)] {
+    for (label, ch) in [("System audio", Some(system)), ("Microphone", mic)] {
         let Some(ch) = ch else { continue };
         if let Some(e) = ch.meter.error.lock().ok().and_then(|e| e.clone()) {
             w.push((Color::Red, format!("✗ {label}: {e}")));
         }
     }
-    let silent_for = match call.last_sound {
+    let silent_for = match system.last_sound {
         Some(t) => t.elapsed(),
         None => elapsed,
     };
     if silent_for >= SILENT_WARN_AFTER {
-        let hint = if call.last_sound.is_none() && cfg!(target_os = "macos") {
+        let hint = if system.last_sound.is_none() && cfg!(target_os = "macos") {
             " If others are talking, allow your terminal app under System Settings › Privacy & \
              Security › Screen & System Audio Recording (\"System Audio Recording Only\"), then restart it."
-        } else if call.last_sound.is_none() {
-            " Check the call plays through the captured device (eavesdrop --list, --system)."
+        } else if system.last_sound.is_none() {
+            " Check the sound plays through the captured device (eavesdrop --list, --system)."
         } else {
             ""
         };
         w.push((
             Color::Yellow,
-            format!("⚠ No call audio for {}.{hint}", fmt_duration(silent_for)),
+            format!("⚠ No system audio for {}.{hint}", fmt_duration(silent_for)),
         ));
     }
     if let Some(m) = mic

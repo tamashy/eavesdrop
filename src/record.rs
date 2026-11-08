@@ -34,7 +34,7 @@ impl Input {
 }
 
 pub struct Recorder {
-    pub call: Input,
+    pub system: Input,
     pub mic: Option<Input>,
     pub out_dir: PathBuf,
     pub mic_gain: f32,
@@ -43,9 +43,9 @@ pub struct Recorder {
 
 pub struct Take {
     pub clock: Arc<Clock>,
-    pub call: Arc<Meter>,
+    pub system: Arc<Meter>,
     pub mic: Option<Arc<Meter>>,
-    call_track: Track,
+    system_track: Track,
     mic_track: Option<Track>,
     work_dir: PathBuf,
     out_dir: PathBuf,
@@ -59,7 +59,7 @@ pub enum Outcome {
     Saved {
         path: PathBuf,
         recorded: Duration,
-        /// Separate call / mic tracks (with --keep-tracks).
+        /// Separate system / mic tracks (with --keep-tracks).
         extra: Vec<PathBuf>,
         warnings: Vec<String>,
     },
@@ -82,14 +82,14 @@ impl Recorder {
             .with_context(|| format!("cannot create {}", work_dir.display()))?;
 
         let clock = Arc::new(Clock::new(Instant::now()));
-        let call = Arc::new(Meter::default());
+        let system = Arc::new(Meter::default());
         let opened = (|| -> Result<_> {
-            let call_track = start_track(
-                &self.call.dev,
-                self.call.cfg,
-                &work_dir.join("call.wav"),
+            let system_track = start_track(
+                &self.system.dev,
+                self.system.cfg,
+                &work_dir.join("system.wav"),
                 clock.clone(),
-                call.clone(),
+                system.clone(),
             )?;
             let mic = match &self.mic {
                 Some(m) => {
@@ -105,9 +105,9 @@ impl Recorder {
                 }
                 None => None,
             };
-            Ok((call_track, mic))
+            Ok((system_track, mic))
         })();
-        let (call_track, mic) = match opened {
+        let (system_track, mic) = match opened {
             Ok(x) => x,
             Err(e) => {
                 std::fs::remove_dir_all(&work_dir).ok();
@@ -120,9 +120,9 @@ impl Recorder {
         };
         Ok(Take {
             clock,
-            call,
+            system,
             mic,
-            call_track,
+            system_track,
             mic_track,
             work_dir,
             out_dir: self.out_dir.clone(),
@@ -147,7 +147,8 @@ impl Take {
     }
 
     /// Stops capturing now; the file is finished on a background thread.
-    pub fn stop(self) -> Saving {
+    /// `description` (may be empty) is saved as the recording's metadata.
+    pub fn stop(self, description: String) -> Saving {
         // Freeze the recorded time so all tracks end at the same point.
         if self.clock.state() == crate::clock::State::Recording {
             self.clock.toggle();
@@ -156,7 +157,7 @@ impl Take {
         let recorded = self.clock.recorded();
         let path = unique(self.output_path());
         // Dropping the streams closes the channels, which lets the writer threads finish.
-        let call = self.call_track.stop();
+        let system = self.system_track.stop();
         let mic = self.mic_track.map(Track::stop);
         let (work_dir, out_dir) = (self.work_dir, self.out_dir);
         let (mic_gain, keep_tracks) = (self.mic_gain, self.keep_tracks);
@@ -165,25 +166,32 @@ impl Take {
                 h.join()
                     .map_err(|_| anyhow::anyhow!("writer thread panicked"))?
             };
-            let call_peak = join(call)?;
+            let system_peak = join(system)?;
             let mic_peak = mic.map(join).transpose()?;
             if !started {
                 std::fs::remove_dir_all(&work_dir).ok();
                 return Ok(Outcome::Discarded);
             }
-            let warnings = silence_warnings(call_peak, mic_peak);
+            let warnings = silence_warnings(system_peak, mic_peak);
 
-            let call_path = work_dir.join("call.wav");
+            let system_path = work_dir.join("system.wav");
             let mic_path = work_dir.join("mic.wav");
             let mic_input = mic_peak.map(|_| mic_path.as_path());
-            mixdown(&call_path, mic_input, mic_gain, &path).with_context(|| {
+            mixdown(&system_path, mic_input, mic_gain, &path).with_context(|| {
                 format!("mixdown failed; raw tracks kept in {}", work_dir.display())
             })?;
+
+            let mut warnings = warnings;
+            if !description.trim().is_empty()
+                && let Err(e) = crate::meta::set_description(&path, &description)
+            {
+                warnings.push(format!("⚠ Description not saved: {e:#}"));
+            }
 
             let mut extra = Vec::new();
             if keep_tracks {
                 let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-                for (p, suffix) in [(&call_path, "call"), (&mic_path, "mic")] {
+                for (p, suffix) in [(&system_path, "system"), (&mic_path, "mic")] {
                     if p.exists() {
                         let dest = out_dir.join(format!("{stem}_{suffix}.wav"));
                         std::fs::rename(p, &dest)?;
@@ -202,16 +210,16 @@ impl Take {
     }
 }
 
-fn silence_warnings(call_peak: f32, mic_peak: Option<f32>) -> Vec<String> {
+fn silence_warnings(system_peak: f32, mic_peak: Option<f32>) -> Vec<String> {
     let mut w = Vec::new();
-    if call_peak < 0.001 {
+    if system_peak < 0.001 {
         w.push(format!(
-            "⚠ Call audio track is (almost) silent. {}",
+            "⚠ System audio track is (almost) silent. {}",
             if cfg!(target_os = "macos") {
                 "On macOS, allow your terminal app under System Settings › Privacy & Security › \
                  Screen & System Audio Recording (\"System Audio Recording Only\")."
             } else {
-                "Check that the call plays through the captured output device (see --list / --system)."
+                "Check that the sound plays through the captured output device (see --list / --system)."
             }
         ));
     }
