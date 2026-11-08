@@ -1,8 +1,8 @@
-//! eavesdrop — record call audio (what you hear + your microphone) locally.
+//! eavesdrop — record audio locally: what plays on the computer (system audio)
+//! plus your microphone, mixed into one WAV file.
 //!
-//! Works with any call app (Zoom, Teams, Meet, …): it captures the system's
-//! audio output via OS loopback and the microphone, so the call app is not involved
-//! and shows no recording indicator.
+//! It captures the system's audio output via OS loopback, so it works with any
+//! app that plays sound, without integrating with it.
 //!
 //!  * macOS 14.6+ : Core Audio process tap (needs "System Audio Recording" permission)
 //!  * Windows     : WASAPI loopback
@@ -11,7 +11,9 @@
 mod browser;
 mod clock;
 mod config;
+mod input;
 mod library;
+mod meta;
 mod player;
 mod record;
 mod ui;
@@ -68,7 +70,7 @@ use cpal::{
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "Record call audio (speaker output + microphone) locally",
+    about = "Record audio locally: what plays on the computer + your microphone",
     args_conflicts_with_subcommands = true
 )]
 struct Opt {
@@ -95,7 +97,7 @@ struct Opt {
     #[arg(long)]
     system: Option<String>,
 
-    /// Don't record the microphone (only the other participants)
+    /// Don't record the microphone (only system audio)
     #[arg(long)]
     no_mic: bool,
 
@@ -118,6 +120,10 @@ struct Opt {
     /// Start recording right away instead of waiting for Space in the terminal UI
     #[arg(long)]
     now: bool,
+
+    /// What the recording is about; saved next to it (edit later with `e` in the app)
+    #[arg(long, value_name = "TEXT")]
+    about: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -148,7 +154,7 @@ fn plain_progress(
     clock: &Clock,
     limit: Option<Duration>,
     stop: &mpsc::Receiver<()>,
-    call: &Meter,
+    system: &Meter,
     mic: Option<&Meter>,
 ) {
     use std::io::Write;
@@ -163,9 +169,9 @@ fn plain_progress(
             }
         };
         print!(
-            "\r  {}  call {}  mic {} ",
+            "\r  {}  system {}  mic {} ",
             ui::fmt_duration(t),
-            db(call.take_peak()),
+            db(system.take_peak()),
             mic.map(|m| db(m.take_peak()))
                 .unwrap_or_else(|| "  off  ".into())
         );
@@ -200,9 +206,8 @@ fn main() -> std::process::ExitCode {
 fn pause_if_own_console() {
     let mut pids = [0u32; 2];
     // SAFETY: the buffer is valid for `pids.len()` entries.
-    let n = unsafe {
-        windows_sys::Win32::System::Console::GetConsoleProcessList(pids.as_mut_ptr(), 2)
-    };
+    let n =
+        unsafe { windows_sys::Win32::System::Console::GetConsoleProcessList(pids.as_mut_ptr(), 2) };
     if n == 1 {
         println!("\nPress Enter to close…");
         let _ = std::io::stdin().read_line(&mut String::new());
@@ -248,7 +253,7 @@ fn run() -> Result<()> {
 
     // ---- pick devices ----------------------------------------------------
     let (sys_dev, sys_cfg) = loopback_device(&host, opt.system.as_deref())?;
-    println!("● Call audio : {}", dev_name(&sys_dev));
+    println!("● System audio : {}", dev_name(&sys_dev));
     let mic = if opt.no_mic {
         None
     } else {
@@ -259,18 +264,18 @@ fn run() -> Result<()> {
                 let cfg = dev
                     .default_input_config()
                     .with_context(|| format!("cannot open microphone {}", dev_name(&dev)))?;
-                println!("● Microphone : {}", dev_name(&dev));
+                println!("● Microphone   : {}", dev_name(&dev));
                 Some((dev, cfg))
             }
             // Default mic: if there is none (e.g. Mac mini without a mic), continue without.
             None => match default_mic(&host) {
                 Some((dev, cfg)) => {
-                    println!("● Microphone : {}", dev_name(&dev));
+                    println!("● Microphone   : {}", dev_name(&dev));
                     Some((dev, cfg))
                 }
                 None => {
                     eprintln!(
-                        "⚠ No usable microphone found — recording call audio only \
+                        "⚠ No usable microphone found — recording system audio only \
                          (connect a mic or pick one with --mic, see --list)"
                     );
                     None
@@ -279,7 +284,7 @@ fn run() -> Result<()> {
         }
     };
     let recorder = record::Recorder {
-        call: record::Input::new(sys_dev, sys_cfg),
+        system: record::Input::new(sys_dev, sys_cfg),
         mic: mic.map(|(d, c)| record::Input::new(d, c)),
         out_dir,
         mic_gain: opt.mic_gain,
@@ -298,6 +303,7 @@ fn run() -> Result<()> {
             recorder,
             limit,
             start_now: opt.now,
+            about: opt.about.clone().unwrap_or_default(),
             stop: stop_rx,
         })?;
         if !pending.is_empty() {
@@ -320,14 +326,14 @@ fn run() -> Result<()> {
         &take.clock,
         limit,
         &stop_rx,
-        &take.call,
+        &take.system,
         take.mic.as_deref(),
     );
     println!(
         "■ Stopping… ({} recorded)",
         ui::fmt_duration(take.clock.recorded())
     );
-    report(take.stop())
+    report(take.stop(opt.about.clone().unwrap_or_default()))
 }
 
 /// Waits for a take to be saved and prints the result.
@@ -620,7 +626,7 @@ where
 }
 
 // ===========================================================================
-// Mixdown: call + mic → one stereo 16-bit WAV (streaming, low memory)
+// Mixdown: system + mic → one stereo 16-bit WAV (streaming, low memory)
 // ===========================================================================
 
 /// Streams a WAV file as stereo frames, resampled to `out_rate` (linear interp).
@@ -688,9 +694,9 @@ impl Source {
     }
 }
 
-fn mixdown(call: &Path, mic: Option<&Path>, mic_gain: f32, out: &Path) -> Result<()> {
-    let out_rate = hound::WavReader::open(call)?.spec().sample_rate;
-    let mut a = Source::open(call, out_rate)?;
+fn mixdown(system: &Path, mic: Option<&Path>, mic_gain: f32, out: &Path) -> Result<()> {
+    let out_rate = hound::WavReader::open(system)?.spec().sample_rate;
+    let mut a = Source::open(system, out_rate)?;
     let mut b = match mic {
         Some(p) => Some(Source::open(p, out_rate)?),
         None => None,
