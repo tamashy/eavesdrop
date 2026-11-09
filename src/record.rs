@@ -56,6 +56,8 @@ pub struct Take {
 pub enum Outcome {
     /// Never started: nothing written.
     Discarded,
+    /// Thrown away with `Take::discard`: nothing saved.
+    Aborted,
     Saved {
         path: PathBuf,
         recorded: Duration,
@@ -149,6 +151,16 @@ impl Take {
     /// Stops capturing now; the file is finished on a background thread.
     /// `description` (may be empty) is saved as the recording's metadata.
     pub fn stop(self, description: String) -> Saving {
+        self.finish(description, true)
+    }
+
+    /// Stops capturing and throws the recording away: nothing is saved and the
+    /// raw tracks are deleted (in the background, once the writers are done).
+    pub fn discard(self) -> Saving {
+        self.finish(String::new(), false)
+    }
+
+    fn finish(self, description: String, save: bool) -> Saving {
         // Freeze the recorded time so all tracks end at the same point.
         if self.clock.state() == crate::clock::State::Recording {
             self.clock.toggle();
@@ -168,9 +180,13 @@ impl Take {
             };
             let system_peak = join(system)?;
             let mic_peak = mic.map(join).transpose()?;
-            if !started {
+            if !started || !save {
                 std::fs::remove_dir_all(&work_dir).ok();
-                return Ok(Outcome::Discarded);
+                return Ok(if started {
+                    Outcome::Aborted
+                } else {
+                    Outcome::Discarded
+                });
             }
             let warnings = silence_warnings(system_peak, mic_peak);
 

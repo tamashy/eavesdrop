@@ -11,9 +11,9 @@ use ratatui::{
     Frame,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Constraint, Layout, Rect},
-    style::{Color, Style, Stylize},
+    style::{Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, BorderType, Cell, Gauge, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Cell, Gauge, Padding, Paragraph, Row, Table, TableState, Wrap},
 };
 
 use crate::{
@@ -21,6 +21,7 @@ use crate::{
     library::{self, Recording},
     meta,
     player::{MAX_VOLUME, Player},
+    theme::{self, Themed, Tone},
     ui::{fmt_bytes, fmt_duration, short_path},
 };
 
@@ -56,8 +57,10 @@ pub struct Library {
     /// Currently loaded recording: (path, player).
     playing: Option<(PathBuf, Player)>,
     volume: f32,
-    status: Option<(Color, String)>,
+    status: Option<(Tone, String)>,
     dialog: Option<Dialog>,
+    /// Scroll offset of the description in the details card.
+    card_scroll: u16,
 }
 
 impl Library {
@@ -71,6 +74,7 @@ impl Library {
             volume: 1.0,
             status: None,
             dialog: None,
+            card_scroll: 0,
         };
         app.rescan()?;
         Ok(app)
@@ -90,7 +94,7 @@ impl Library {
 
     fn rescan_or_report(&mut self) {
         if let Err(e) = self.rescan() {
-            self.set_status(Color::Red, format!("✗ {e:#}"));
+            self.set_status(Tone::Err, format!("✗ {e:#}"));
         }
     }
 
@@ -104,8 +108,8 @@ impl Library {
         }
     }
 
-    pub fn set_status(&mut self, color: Color, text: impl Into<String>) {
-        self.status = Some((color, text.into()));
+    pub fn set_status(&mut self, tone: Tone, text: impl Into<String>) {
+        self.status = Some((tone, text.into()));
     }
 
     /// A dialog is open: it gets all keys (including q / Tab).
@@ -132,7 +136,7 @@ impl Library {
     fn refuse_while_recording(&mut self) -> bool {
         if self.recording {
             self.set_status(
-                Color::Yellow,
+                Tone::Warn,
                 "⏺ Recording in progress — pause or stop it to listen (playback would be recorded too)",
             );
         }
@@ -152,7 +156,7 @@ impl Library {
                 self.playing = Some((path, p));
                 self.status = None;
             }
-            Err(e) => self.status = Some((Color::Red, format!("✗ {e:#}"))),
+            Err(e) => self.status = Some((Tone::Err, format!("✗ {e:#}"))),
         }
     }
 
@@ -183,6 +187,9 @@ impl Library {
         }
         let cur = self.table.selected().unwrap_or(0) as isize;
         let next = (cur + delta).clamp(0, self.recs.len() as isize - 1);
+        if next != cur {
+            self.card_scroll = 0;
+        }
         self.table.select(Some(next as usize));
     }
 
@@ -210,6 +217,9 @@ impl Library {
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::PageUp => self.move_selection(-10),
             KeyCode::PageDown => self.move_selection(10),
+            // Clamped to the description's length when drawn.
+            KeyCode::Char('J') => self.card_scroll = self.card_scroll.saturating_add(1),
+            KeyCode::Char('K') => self.card_scroll = self.card_scroll.saturating_sub(1),
             KeyCode::Enter => self.play_selected(),
             KeyCode::Char(' ') | KeyCode::Char('p') => self.toggle_playback(),
 
@@ -294,7 +304,7 @@ impl Library {
                 Action::Submit => match meta::set_description(&path, &input.text()) {
                     Ok(()) => {
                         self.set_status(
-                            Color::Green,
+                            Tone::Ok,
                             format!("✓ Saved description of {}", name_of(&path)),
                         );
                         self.rescan_or_report();
@@ -333,7 +343,7 @@ impl Library {
         let new = result?;
         self.rescan_or_report();
         self.select_path(&new);
-        self.set_status(Color::Green, format!("✓ Renamed to {}", name_of(&new)));
+        self.set_status(Tone::Ok, format!("✓ Renamed to {}", name_of(&new)));
         Ok(())
     }
 
@@ -354,7 +364,7 @@ impl Library {
                 } else {
                     "Moved to the Trash:"
                 };
-                self.set_status(Color::Green, format!("✓ {how} {}", name_of(&path)));
+                self.set_status(Tone::Ok, format!("✓ {how} {}", name_of(&path)));
                 self.rescan_or_report();
                 None
             }
@@ -363,7 +373,7 @@ impl Library {
                 trash_failed: Some(format!("{e:#}")),
             }),
             Err(e) => {
-                self.set_status(Color::Red, format!("✗ {e:#}"));
+                self.set_status(Tone::Err, format!("✗ {e:#}"));
                 self.rescan_or_report();
                 None
             }
@@ -399,7 +409,10 @@ pub fn run(dir: PathBuf, start: Option<PathBuf>) -> Result<()> {
     let mut terminal = crate::ui::init_terminal();
     let result = (|| -> Result<()> {
         loop {
-            terminal.draw(|f| app.draw(f, f.area()))?;
+            terminal.draw(|f| {
+                crate::ui::fill_background(f);
+                app.draw(f, f.area());
+            })?;
             if !event::poll(TICK)? {
                 continue;
             }
@@ -414,6 +427,10 @@ pub fn run(dir: PathBuf, start: Option<PathBuf>) -> Result<()> {
                         KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                             return Ok(());
+                        }
+                        KeyCode::Char('t') => {
+                            let t = theme::cycle();
+                            app.set_status(Tone::Ok, format!("Theme: {}", t.name));
                         }
                         _ => app.handle_key(k),
                     }
@@ -433,39 +450,45 @@ impl Library {
     }
 }
 
-fn key_span(k: &'static str) -> Span<'static> {
-    Span::styled(
-        format!(" {k} "),
-        Style::new().fg(Color::Black).bg(Color::Gray),
-    )
+pub fn key_span(k: &'static str) -> Span<'static> {
+    Span::styled(format!(" {k} "), theme::get().key())
 }
 
+/// The details card goes to the right of the list from this width on, below it otherwise.
+const SIDE_CARD_MIN_WIDTH: u16 = 100;
+
 fn draw(f: &mut Frame, app: &mut Library, area: Rect) {
-    let [list_area, about_area, now_area, status_area, footer] = Layout::vertical([
-        Constraint::Min(3),
-        Constraint::Length(5),
+    let t = theme::get();
+    let [main_area, now_area, status_area, footer] = Layout::vertical([
+        Constraint::Min(6),
         Constraint::Length(5),
         Constraint::Length(1),
         Constraint::Length(2),
     ])
     .areas(area);
+    let side = main_area.width >= SIDE_CARD_MIN_WIDTH;
+    let [list_area, card_area] = if side {
+        let w = (main_area.width * 2 / 5).clamp(36, 64);
+        Layout::horizontal([Constraint::Min(40), Constraint::Length(w)]).areas(main_area)
+    } else {
+        Layout::vertical([Constraint::Fill(1), Constraint::Fill(1)]).areas(main_area)
+    };
 
     // ---- list --------------------------------------------------------------
     let playing_path = app.playing.as_ref().map(|(p, _)| p.clone());
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .title(Line::from(vec![
-            Span::raw(" Recordings · ").bold(),
-            Span::raw(short_path(
-                &app.dir,
-                list_area.width.saturating_sub(24) as usize,
-            )),
-            Span::raw(format!(" ({}) ", app.recs.len())).dim(),
-        ]));
+    let block = theme::panel().title(Line::from(vec![
+        Span::raw(" Recordings · ").bold(),
+        Span::raw(short_path(
+            &app.dir,
+            list_area.width.saturating_sub(24) as usize,
+        )),
+        Span::raw(format!(" ({}) ", app.recs.len())).subtle(),
+    ]));
     if app.recs.is_empty() {
         f.render_widget(
             Paragraph::new("No recordings yet. Run `eavesdrop` and press Space to record.")
-                .dim()
+                .subtle()
+                .wrap(Wrap { trim: true })
                 .block(block),
             list_area,
         );
@@ -484,7 +507,7 @@ fn draw(f: &mut Frame, app: &mut Library, area: Rect) {
                 " "
             };
             Row::new(vec![
-                Cell::from(marker).fg(Color::Green),
+                Cell::from(marker).fg(t.ok),
                 Cell::from(library::fmt_modified(r.modified)),
                 Cell::from(
                     r.duration
@@ -493,7 +516,7 @@ fn draw(f: &mut Frame, app: &mut Library, area: Rect) {
                 ),
                 Cell::from(format!("{:>9}", fmt_bytes(r.size))),
                 Cell::from(r.name.clone()),
-                Cell::from(r.summary().to_string()).fg(Color::Cyan),
+                Cell::from(r.summary().to_string()).fg(t.info),
             ])
         });
         let table = Table::new(
@@ -508,38 +531,23 @@ fn draw(f: &mut Frame, app: &mut Library, area: Rect) {
             ],
         )
         .header(
-            Row::new(vec!["", "Date", "Length", "     Size", "File", "About"])
-                .style(Style::new().dim()),
+            Row::new(vec!["", "Date", "Length", "     Size", "File", "About"]).style(t.subtle()),
         )
         .column_spacing(2)
-        .row_highlight_style(Style::new().bg(Color::DarkGray).bold())
+        .row_highlight_style(Style::new().bg(t.highlight).bold())
         .block(block);
         f.render_stateful_widget(table, list_area, &mut app.table);
     }
 
-    // ---- about the selected recording --------------------------------------
-    let about_block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .title(" About ");
-    let about = match app.selected() {
-        None => Paragraph::new(""),
-        Some(r) if r.description.is_empty() => Paragraph::new(Line::from(vec![
-            Span::raw("No description — press ").dim(),
-            key_span("e"),
-            Span::raw(" to add what this recording is about").dim(),
-        ])),
-        Some(r) => Paragraph::new(r.description.clone()).wrap(Wrap { trim: false }),
-    };
-    f.render_widget(about.block(about_block), about_area);
+    // ---- details card of the selected recording ----------------------------
+    draw_card(f, app, card_area, playing_path.as_deref(), side);
 
     // ---- now playing -------------------------------------------------------
-    let now_block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .title(" Now playing ");
+    let now_block = theme::panel().title(" Now playing ");
     match &app.playing {
         None => f.render_widget(
             Paragraph::new("Nothing playing — select a recording and press Enter")
-                .dim()
+                .subtle()
                 .block(now_block),
             now_area,
         ),
@@ -551,11 +559,11 @@ fn draw(f: &mut Frame, app: &mut Library, area: Rect) {
             let pos = p.position();
             let dur = p.duration();
             let (icon, color) = if p.finished() {
-                ("■ ", Color::DarkGray)
+                ("■ ", t.off)
             } else if p.paused() {
-                ("❚❚ ", Color::Yellow)
+                ("❚❚ ", t.warn)
             } else {
-                ("▶ ", Color::Green)
+                ("▶ ", t.ok)
             };
             f.render_widget(
                 Line::from(vec![
@@ -574,23 +582,19 @@ fn draw(f: &mut Frame, app: &mut Library, area: Rect) {
                     .ratio(ratio)
                     .label(format!("{} / {}", fmt_duration(pos), fmt_duration(dur)))
                     .use_unicode(true)
-                    .gauge_style(Style::new().fg(Color::Cyan).bg(Color::Black)),
+                    .gauge_style(Style::new().fg(t.info).bg(t.track)),
                 bar,
             );
             let width = 20usize;
             let filled = ((app.volume / MAX_VOLUME) * width as f32).round() as usize;
             f.render_widget(
                 Line::from(vec![
-                    Span::raw("Volume ").dim(),
+                    Span::raw("Volume ").subtle(),
                     Span::styled(
                         "█".repeat(filled),
-                        Style::new().fg(if app.volume > 1.0 {
-                            Color::Yellow
-                        } else {
-                            Color::Green
-                        }),
+                        Style::new().fg(if app.volume > 1.0 { t.warn } else { t.ok }),
                     ),
-                    Span::raw("░".repeat(width - filled)).dim(),
+                    Span::styled("░".repeat(width - filled), Style::new().fg(t.off)),
                     Span::raw(format!(" {:>3.0}%", app.volume * 100.0)),
                 ]),
                 vol,
@@ -602,11 +606,11 @@ fn draw(f: &mut Frame, app: &mut Library, area: Rect) {
     let status = app.status.clone().or_else(|| {
         app.player()
             .and_then(|p| p.error())
-            .map(|e| (Color::Red, format!("✗ {e}")))
+            .map(|e| (Tone::Err, format!("✗ {e}")))
     });
-    if let Some((color, text)) = status {
+    if let Some((tone, text)) = status {
         f.render_widget(
-            Line::from(Span::styled(text, Style::new().fg(color))),
+            Line::from(Span::styled(text, Style::new().fg(tone.color()))),
             status_area,
         );
     }
@@ -634,12 +638,16 @@ fn draw(f: &mut Frame, app: &mut Library, area: Rect) {
             Line::from(vec![
                 key("e"),
                 Span::raw(" describe  "),
+                key("J K"),
+                Span::raw(" scroll  "),
                 key("r"),
                 Span::raw(" rename  "),
                 key("d"),
                 Span::raw(" delete  "),
                 key("F5"),
                 Span::raw(" refresh  "),
+                key("t"),
+                Span::raw(" theme  "),
                 key("q"),
                 Span::raw(" quit"),
             ]),
@@ -648,16 +656,126 @@ fn draw(f: &mut Frame, app: &mut Library, area: Rect) {
     );
 }
 
+/// Details of the selected recording: file info and the full description.
+/// `tall`: list the file info one item per line (side card), else on one line.
+fn draw_card(f: &mut Frame, app: &mut Library, area: Rect, playing: Option<&Path>, tall: bool) {
+    let t = theme::get();
+    let block = theme::panel()
+        .title(" Details ")
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let Some(r) = app.selected() else {
+        f.render_widget(Paragraph::new("No recording selected").subtle(), inner);
+        return;
+    };
+
+    let field = |label: &'static str, value: String| {
+        Line::from(vec![
+            Span::raw(format!("{label:<8}")).subtle(),
+            Span::raw(value),
+        ])
+    };
+    let mut head = vec![Line::from(Span::raw(r.name.clone()).bold())];
+    if playing == Some(r.path.as_path()) {
+        head.push(Line::from(Span::styled(
+            "▶ loaded in player",
+            Style::new().fg(t.ok),
+        )));
+    }
+    let date = library::fmt_modified(r.modified);
+    let length = r
+        .duration
+        .map(fmt_duration)
+        .unwrap_or_else(|| "--:--:--".into());
+    let size = fmt_bytes(r.size);
+    if tall {
+        head.extend([
+            field("Date", date),
+            field("Length", length),
+            field("Size", size),
+        ]);
+    } else {
+        head.push(Line::from(vec![
+            Span::raw(date),
+            Span::raw(" · ").subtle(),
+            Span::raw(length),
+            Span::raw(" · ").subtle(),
+            Span::raw(size),
+        ]));
+    }
+    let head = Paragraph::new(head).wrap(Wrap { trim: false });
+    let head_h = (head.line_count(inner.width) as u16).min(inner.height);
+    let description = r.description.clone();
+
+    let [head_area, rule_area, about_area] = Layout::vertical([
+        Constraint::Length(head_h),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+    f.render_widget(head, head_area);
+    f.render_widget(
+        Line::from(vec![
+            Span::styled("About ", Style::new().fg(t.accent).bold()),
+            Span::styled(
+                "─".repeat(rule_area.width.saturating_sub(6) as usize),
+                Style::new().fg(t.border),
+            ),
+        ]),
+        rule_area,
+    );
+
+    if description.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw("No description — press ").subtle(),
+                key_span("e"),
+                Span::raw(" to add what this recording is about").subtle(),
+            ]))
+            .wrap(Wrap { trim: false }),
+            about_area,
+        );
+        return;
+    }
+    let about = Paragraph::new(description)
+        .fg(t.info)
+        .wrap(Wrap { trim: false });
+    let total = about.line_count(about_area.width) as u16;
+    let max_scroll = total.saturating_sub(about_area.height);
+    app.card_scroll = app.card_scroll.min(max_scroll);
+    f.render_widget(about.scroll((app.card_scroll, 0)), about_area);
+
+    // Scroll position hint in the bottom border when it doesn't all fit.
+    if max_scroll > 0 && area.height > 2 {
+        let more = match (app.card_scroll > 0, app.card_scroll < max_scroll) {
+            (true, true) => " ↑↓ more · J K ",
+            (false, _) => " ↓ more · J K ",
+            (true, false) => " ↑ more · J K ",
+        };
+        let w = more.chars().count() as u16;
+        let x = area.right().saturating_sub(w + 2).max(area.x + 1);
+        f.render_widget(
+            Span::raw(more).subtle(),
+            Rect::new(x, area.bottom() - 1, w.min(area.width.saturating_sub(2)), 1),
+        );
+    }
+}
+
 fn draw_dialog(f: &mut Frame, app: &mut Library, area: Rect) {
     let Some(dialog) = &mut app.dialog else {
         return;
     };
-    let error_line =
-        |e: &String| Line::from(Span::styled(format!("✗ {e}"), Style::new().fg(Color::Red)));
+    let error_line = |e: &String| {
+        Line::from(Span::styled(
+            format!("✗ {e}"),
+            Style::new().fg(theme::get().err),
+        ))
+    };
     match dialog {
         Dialog::Rename { path, input, error } => {
             let mut info = vec![Line::from(vec![
-                Span::raw("Current: ").dim(),
+                Span::raw("Current: ").subtle(),
                 Span::raw(name_of(path)),
             ])];
             info.extend(error.iter().map(error_line));
@@ -671,9 +789,9 @@ fn draw_dialog(f: &mut Frame, app: &mut Library, area: Rect) {
         }
         Dialog::Describe { path, input, error } => {
             let mut info = vec![Line::from(vec![
-                Span::raw("What is ").dim(),
+                Span::raw("What is ").subtle(),
                 Span::raw(name_of(path)).bold(),
-                Span::raw(" about? Topic, people, key points…").dim(),
+                Span::raw(" about? Topic, people, key points…").subtle(),
             ])];
             info.extend(error.iter().map(error_line));
             input::draw_input(
@@ -710,9 +828,9 @@ fn draw_dialog(f: &mut Frame, app: &mut Library, area: Rect) {
                                 Span::raw(name).bold(),
                                 Span::raw(format!("{also} to the {bin}?")),
                             ]),
-                            Line::from(format!("You can restore it from the {bin}.")).dim(),
+                            Line::from(format!("You can restore it from the {bin}.")).subtle(),
                         ],
-                        Color::Yellow,
+                        Tone::Warn,
                     );
                 }
                 Some(reason) => input::draw_confirm(
@@ -722,7 +840,7 @@ fn draw_dialog(f: &mut Frame, app: &mut Library, area: Rect) {
                     vec![
                         Line::from(Span::styled(
                             format!("Couldn't move it to the Trash: {reason}"),
-                            Style::new().fg(Color::Red),
+                            Style::new().fg(theme::get().err),
                         )),
                         Line::from(vec![
                             Span::raw("Delete "),
@@ -730,7 +848,7 @@ fn draw_dialog(f: &mut Frame, app: &mut Library, area: Rect) {
                             Span::raw(format!("{also} permanently? This can't be undone.")),
                         ]),
                     ],
-                    Color::Red,
+                    Tone::Err,
                 ),
             }
         }
@@ -742,7 +860,7 @@ pub fn describe_hint(input: &TextInput) -> Line<'static> {
     if input.discard_armed() {
         Line::from(Span::styled(
             "Unsaved changes — press Esc again to discard, Ctrl+S to save",
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(theme::get().warn),
         ))
     } else {
         Line::from(vec![
@@ -779,4 +897,67 @@ pub fn print_list(dir: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    use super::*;
+
+    fn sample_dir(name: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("eavesdrop-browser-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 8000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let wav = d.join("standup.wav");
+        let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+        for _ in 0..8000 {
+            w.write_sample(0i16).unwrap();
+        }
+        w.finalize().unwrap();
+        meta::set_description(
+            &wav,
+            "Weekly standup\nAction items:\n- bump version\n- retag",
+        )
+        .unwrap();
+        d
+    }
+
+    fn render(app: &mut Library, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.draw(f, f.area())).unwrap();
+        let buf = term.backend().buffer();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn details_card_shows_every_description_line() {
+        let dir = sample_dir("card");
+        let mut app = Library::new(dir.clone()).unwrap();
+        for (w, h) in [(120, 24), (80, 30)] {
+            let screen = render(&mut app, w, h);
+            if std::env::var_os("SHOW_SCREEN").is_some() {
+                println!("{screen}\n");
+            }
+            assert!(screen.contains("Details"), "{w}x{h}:\n{screen}");
+            for line in [
+                "Weekly standup",
+                "Action items:",
+                "- bump version",
+                "- retag",
+            ] {
+                assert!(screen.contains(line), "{w}x{h} missing {line:?}:\n{screen}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
