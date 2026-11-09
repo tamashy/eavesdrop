@@ -77,17 +77,22 @@ without leaving the app.
 ### ● Record
 
 It opens in the **READY** state with the level meters already live, so you can check that system
-audio and mic come through before pressing Space. The screen shows level meters and the last 60 s
-of level for system audio and the mic, recorded time, size so far, and warnings (e.g. no system
-audio → permission hint).
+audio and mic come through before you press Space.
+
+System audio and the mic each get a meter on a -60…0 dB scale. The bar turns yellow at -12 dB
+and red at -3 dB. A thin marker holds the recent peak, and a CLIP badge lights up when you hit
+full scale. Below each meter you see the last 60 s of level. The screen also shows recorded
+time, size so far, and warnings (e.g. no system audio → permission hint).
 
 | Key                      | Action |
 |--------------------------|--------|
 | `Space` / `p` / `Enter`  | start recording · pause · resume |
 | `s`                      | stop & save, then get ready for the next recording |
+| `x`                      | discard: stop without saving (asks first) |
 | `m`                      | mute/unmute your mic in the recording |
 | `e`                      | note what this recording is about (saved with it) |
 | `Tab`                    | go to Recordings |
+| `t`                      | next color theme |
 | `q` / `Esc` / `Ctrl+C`   | quit (saves the current recording first, if one was started) |
 
 Saving happens in the background. When it's done, the new file shows up in Recordings, already
@@ -95,9 +100,10 @@ selected: press Tab, then Enter, to listen to it. `--minutes` stops & saves the 
 
 ### ♫ Recordings
 
-Lists the WAV files in the recordings folder, newest first, with what each one is about. Below
-the list are the full description of the selected recording and the player. Playback goes to
-the system default output device.
+The list shows the WAV files in the recordings folder, newest first, with the first line of
+each description. The details card on the right (below the list in a narrow terminal) shows
+the selected recording's date, length, size and full description. The player sits at the
+bottom and plays through the system default output device.
 
 | Key                              | Action |
 |----------------------------------|--------|
@@ -110,9 +116,11 @@ the system default output device.
 | `Home`                           | back to the start |
 | `+` / `-`                        | volume up / down (10 % steps, 0–200 %) |
 | `e`                              | describe: what the recording is about (multi-line) |
+| `J` `K`                          | scroll a long description in the details card |
 | `r` / `F2`                       | rename (its description is renamed with it) |
 | `d` / `Delete`                   | delete: moves it to the Trash / Recycle Bin after you confirm |
 | `F5` / `R`                       | refresh the list |
+| `t`                              | next color theme |
 | `Tab` / `Esc`                    | back to Record |
 | `q`                              | quit |
 
@@ -152,9 +160,21 @@ Windows: `%APPDATA%\eavesdrop\config.toml`):
 ```toml
 # Folder where recordings are saved. `~` expands to your home directory.
 output_dir = "~/Documents/Recordings"
+
+# Color theme (see below).
+theme = "catppuccin-mocha"
 ```
 
 `--out` overrides `output_dir`. If neither is set, recordings go to `~/Recordings/eavesdrop`.
+
+### Themes
+
+`default` keeps your terminal's colors. The others set their own background:
+`catppuccin-mocha` (or just `catppuccin`), `catppuccin-macchiato`, `catppuccin-frappe`,
+`catppuccin-latte` (light), `gruvbox-dark`, `nord` and `tokyo-night`.
+
+Press `t` in the app to cycle through them. To keep one, set `theme` in the config or pass
+`--theme <name>`; the flag wins over the config.
 
 Notes
 - It captures *all* sound played through the chosen output device, so turn off sounds you

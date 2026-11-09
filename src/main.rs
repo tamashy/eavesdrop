@@ -14,8 +14,10 @@ mod config;
 mod input;
 mod library;
 mod meta;
+mod meter;
 mod player;
 mod record;
+mod theme;
 mod ui;
 
 use clock::Clock;
@@ -89,6 +91,10 @@ struct Opt {
     #[arg(long, value_name = "PATH", global = true)]
     config: Option<PathBuf>,
 
+    /// Color theme (default, catppuccin-mocha, catppuccin-latte, nord, …; `t` cycles in the app)
+    #[arg(long, value_name = "NAME", global = true)]
+    theme: Option<String>,
+
     /// Microphone to use (part of its name or id). Default: system default input
     #[arg(long)]
     mic: Option<String>,
@@ -138,9 +144,8 @@ enum Cmd {
 }
 
 /// Recordings folder: --out, else `output_dir` from the config, else ~/Recordings/eavesdrop.
-fn recordings_dir(opt: &Opt) -> Result<PathBuf> {
-    let cfg = config::Config::load(opt.config.as_deref())?;
-    match opt.out.clone().or(cfg.output_dir) {
+fn recordings_dir(opt: &Opt, cfg: &config::Config) -> Result<PathBuf> {
+    match opt.out.clone().or(cfg.output_dir.clone()) {
         Some(p) => Ok(p),
         None => Ok(dirs::home_dir()
             .ok_or_else(|| anyhow!("cannot determine home directory, use --out"))?
@@ -225,8 +230,13 @@ fn run() -> Result<()> {
         return list_devices(&host);
     }
 
+    let cfg = config::Config::load(opt.config.as_deref())?;
+    if let Some(name) = opt.theme.as_deref().or(cfg.theme.as_deref()) {
+        theme::set(name)?;
+    }
+
     match &opt.cmd {
-        Some(Cmd::Recordings) => return browser::print_list(&recordings_dir(&opt)?),
+        Some(Cmd::Recordings) => return browser::print_list(&recordings_dir(&opt, &cfg)?),
         Some(Cmd::Play { file }) => {
             if !std::io::stdout().is_terminal() {
                 bail!("`eavesdrop play` needs a terminal (use `eavesdrop recordings` to list)");
@@ -241,13 +251,13 @@ fn run() -> Result<()> {
                     let dir = f.parent().map(Path::to_path_buf).unwrap_or_default();
                     browser::run(dir, Some(f))
                 }
-                None => browser::run(recordings_dir(&opt)?, None),
+                None => browser::run(recordings_dir(&opt, &cfg)?, None),
             };
         }
         None => {}
     }
 
-    let out_dir = recordings_dir(&opt)?;
+    let out_dir = recordings_dir(&opt, &cfg)?;
     std::fs::create_dir_all(&out_dir)
         .with_context(|| format!("cannot create {}", out_dir.display()))?;
 
@@ -343,6 +353,7 @@ fn report(saving: record::Saving) -> Result<()> {
         .map_err(|_| anyhow!("save thread panicked"))??;
     match outcome {
         record::Outcome::Discarded => println!("Recording was never started — nothing saved."),
+        record::Outcome::Aborted => println!("✗ Recording discarded — nothing saved."),
         record::Outcome::Saved {
             path,
             recorded,

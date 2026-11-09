@@ -7,6 +7,9 @@
 //! ```toml
 //! # Folder where recordings are saved. `~` expands to your home directory.
 //! output_dir = "~/Documents/Recordings"
+//!
+//! # Color theme: default, catppuccin-mocha, catppuccin-latte, nord, … (see `theme`).
+//! theme = "catppuccin-mocha"
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -19,6 +22,8 @@ use serde::Deserialize;
 pub struct Config {
     /// Folder where recordings are saved.
     pub output_dir: Option<PathBuf>,
+    /// Color theme name.
+    pub theme: Option<String>,
 }
 
 impl Config {
@@ -44,6 +49,11 @@ impl Config {
     fn parse(text: &str) -> Result<Self> {
         let mut cfg: Self = toml::from_str(text)?;
         cfg.output_dir = cfg.output_dir.map(|p| expand_tilde(&p));
+        if let Some(t) = &cfg.theme
+            && crate::theme::find(t).is_none()
+        {
+            anyhow::bail!("unknown theme {t:?} (available: {})", crate::theme::names());
+        }
         Ok(cfg)
     }
 }
@@ -91,6 +101,13 @@ mod tests {
     fn tilde_expands() {
         let cfg = Config::parse(r#"output_dir = "~/Recs""#).unwrap();
         assert_eq!(cfg.output_dir, Some(dirs::home_dir().unwrap().join("Recs")));
+    }
+
+    #[test]
+    fn theme_is_validated() {
+        let cfg = Config::parse(r#"theme = "catppuccin-latte""#).unwrap();
+        assert_eq!(cfg.theme.as_deref(), Some("catppuccin-latte"));
+        assert!(Config::parse(r#"theme = "neon""#).is_err());
     }
 
     #[test]

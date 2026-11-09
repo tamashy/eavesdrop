@@ -17,9 +17,9 @@ use ratatui::{
     Frame,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style, Stylize},
+    style::{Color, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, BorderType, Gauge, Paragraph, Sparkline, Wrap},
+    widgets::{Block, Paragraph, Wrap},
 };
 
 use crate::{
@@ -27,13 +27,21 @@ use crate::{
     browser::{self, Library},
     clock::State,
     input::{self, Action, TextInput},
+    meter,
     record::{Outcome, Recorder, Saving, Take},
+    theme::{self, Themed, Tone},
 };
 
 const TICK: Duration = Duration::from_millis(100);
 const HISTORY: usize = 600; // 60 s at 10 Hz
 const SILENCE: f32 = 0.001; // -60 dBFS
 const SILENT_WARN_AFTER: Duration = Duration::from_secs(15);
+/// Peak marker stays put this long before falling back.
+const PEAK_HOLD: Duration = Duration::from_millis(1500);
+/// "CLIP" stays visible this long after a sample hit full scale.
+const CLIP_SHOW: Duration = Duration::from_secs(3);
+/// Peak at or above this counts as clipping (-0.1 dBFS).
+const CLIP: f32 = 0.9886;
 
 pub struct Config {
     pub recorder: Recorder,
@@ -51,6 +59,10 @@ struct Channel {
     name: String,
     meter: Arc<Meter>,
     level: f32,
+    /// Recent peak, held for `PEAK_HOLD` then falling.
+    peak: f32,
+    peak_at: Instant,
+    clipped_at: Option<Instant>,
     hist: VecDeque<u64>,
     last_sound: Option<Instant>,
 }
@@ -61,6 +73,9 @@ impl Channel {
             name,
             meter,
             level: 0.0,
+            peak: 0.0,
+            peak_at: Instant::now(),
+            clipped_at: None,
             hist: VecDeque::with_capacity(HISTORY),
             last_sound: None,
         }
@@ -70,6 +85,15 @@ impl Channel {
         let p = self.meter.take_peak();
         // Fast attack, smooth release so the meter is readable.
         self.level = p.max(self.level * 0.75);
+        if p >= self.peak {
+            self.peak = p;
+            self.peak_at = now;
+        } else if now.duration_since(self.peak_at) >= PEAK_HOLD {
+            self.peak = (self.peak * 0.8).max(self.level);
+        }
+        if p >= CLIP {
+            self.clipped_at = Some(now);
+        }
         if self.hist.len() == HISTORY {
             self.hist.pop_front();
         }
@@ -77,6 +101,10 @@ impl Channel {
         if p > SILENCE {
             self.last_sound = Some(now);
         }
+    }
+
+    fn clipping(&self) -> bool {
+        self.clipped_at.is_some_and(|t| t.elapsed() < CLIP_SHOW)
     }
 
     fn muted(&self) -> bool {
@@ -107,12 +135,13 @@ fn db_label(p: f32) -> String {
 
 fn level_color(p: f32) -> Color {
     let db = 20.0 * p.max(1e-9).log10();
+    let t = theme::get();
     if db > -3.0 {
-        Color::Red
+        t.err
     } else if db > -12.0 {
-        Color::Yellow
+        t.warn
     } else {
-        Color::Green
+        t.ok
     }
 }
 
@@ -164,11 +193,13 @@ struct App {
     /// Takes being finished in the background.
     saving: Vec<Saving>,
     /// Result of the last save, shown on the Record view.
-    notes: Vec<(Color, String)>,
+    notes: Vec<(Tone, String)>,
     /// Description of the current recording, saved with it.
     about: String,
     /// Editor for `about` while open.
     about_edit: Option<TextInput>,
+    /// "Discard this recording?" is being asked.
+    confirm_discard: bool,
 }
 
 impl App {
@@ -185,6 +216,7 @@ impl App {
             notes: Vec::new(),
             about,
             about_edit: None,
+            confirm_discard: false,
         };
         app.open_take();
         Ok(app)
@@ -222,15 +254,34 @@ impl App {
 
     /// Stops the current take, saves it in the background, gets a new one ready.
     fn stop_and_save(&mut self) {
+        self.confirm_discard = false;
         let Some(live) = self.live.take() else { return };
         let name = live.take.output_path();
         self.saving
             .push(live.take.stop(std::mem::take(&mut self.about)));
         self.notes = vec![(
-            Color::Yellow,
+            Tone::Warn,
             format!(
                 "… Saving {}",
                 name.file_name().unwrap_or_default().to_string_lossy()
+            ),
+        )];
+        self.open_take();
+    }
+
+    /// Throws the current take away (nothing saved) and gets a new one ready.
+    fn discard(&mut self) {
+        self.confirm_discard = false;
+        let Some(live) = self.live.take() else { return };
+        let recorded = live.take.clock.recorded();
+        // Joined like a save, so its temp files are gone before the app exits.
+        self.saving.push(live.take.discard());
+        self.about.clear();
+        self.notes = vec![(
+            Tone::Warn,
+            format!(
+                "✗ Recording discarded ({} not saved)",
+                fmt_duration(recorded)
             ),
         )];
         self.open_take();
@@ -247,7 +298,7 @@ impl App {
                 .join()
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("save thread panicked")));
             match result {
-                Ok(Outcome::Discarded) => continue,
+                Ok(Outcome::Discarded | Outcome::Aborted) => continue,
                 Ok(Outcome::Saved {
                     path,
                     recorded,
@@ -259,21 +310,20 @@ impl App {
                         "✓ Saved {name} ({}) — Tab to listen",
                         fmt_duration(recorded)
                     );
-                    self.library
-                        .set_status(Color::Green, format!("✓ Saved {name}"));
-                    self.notes = vec![(Color::Green, msg)];
+                    self.library.set_status(Tone::Ok, format!("✓ Saved {name}"));
+                    self.notes = vec![(Tone::Ok, msg)];
                     self.notes
-                        .extend(warnings.into_iter().map(|w| (Color::Yellow, w)));
+                        .extend(warnings.into_iter().map(|w| (Tone::Warn, w)));
                     saved = Some(path.clone());
                 }
                 Err(e) => {
                     let msg = format!("✗ Saving failed: {e:#}");
-                    self.library.set_status(Color::Red, msg.clone());
-                    self.notes = vec![(Color::Red, msg)];
+                    self.library.set_status(Tone::Err, msg.clone());
+                    self.notes = vec![(Tone::Err, msg)];
                 }
             }
             if let Err(e) = self.library.rescan() {
-                self.library.set_status(Color::Red, format!("✗ {e:#}"));
+                self.library.set_status(Tone::Err, format!("✗ {e:#}"));
             }
             if let Some(p) = &saved {
                 self.library.select_path(p);
@@ -327,6 +377,19 @@ impl App {
             }
             return true;
         }
+        if self.confirm_discard {
+            match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.discard(),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                    self.confirm_discard = false
+                }
+                KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.confirm_discard = false
+                }
+                _ => {}
+            }
+            return true;
+        }
         if self.view == View::Recordings && self.library.modal_open() {
             self.library.handle_key(k);
             return true;
@@ -334,6 +397,10 @@ impl App {
         match k.code {
             KeyCode::Char('q') => return false,
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return false,
+            KeyCode::Char('t') => {
+                theme::cycle();
+                return true;
+            }
             KeyCode::Tab | KeyCode::BackTab => {
                 self.view = match self.view {
                     View::Record => View::Recordings,
@@ -350,6 +417,11 @@ impl App {
                 KeyCode::Char('s') => {
                     if self.live.as_ref().is_some_and(|l| l.take.clock.started()) {
                         self.stop_and_save();
+                    }
+                }
+                KeyCode::Char('x') => {
+                    if self.live.as_ref().is_some_and(|l| l.take.clock.started()) {
+                        self.confirm_discard = true;
                     }
                 }
                 KeyCode::Char('m') => {
@@ -421,6 +493,8 @@ pub fn run(cfg: Config) -> Result<Vec<Saving>> {
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
+    let t = theme::get();
+    fill_background(f);
     let [tabs, body] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(f.area());
 
@@ -429,10 +503,10 @@ fn draw(f: &mut Frame, app: &mut App) {
         if app.view == v {
             Span::styled(
                 format!(" {label} "),
-                Style::new().fg(Color::Black).bg(Color::Cyan).bold(),
+                Style::new().fg(t.on_color).bg(t.accent).bold(),
             )
         } else {
-            Span::raw(format!(" {label} ")).dim()
+            Span::raw(format!(" {label} ")).subtle()
         }
     };
     let mut spans = vec![
@@ -440,7 +514,8 @@ fn draw(f: &mut Frame, app: &mut App) {
         tab("● Record", View::Record),
         Span::raw(" "),
         tab("♫ Recordings", View::Recordings),
-        Span::raw("   Tab switch").dim(),
+        Span::raw("   Tab switch · t theme: ").subtle(),
+        Span::raw(t.name).subtle(),
     ];
     if let Some(live) = &app.live {
         let clock = &live.take.clock;
@@ -449,14 +524,14 @@ fn draw(f: &mut Frame, app: &mut App) {
             State::Recording => {
                 spans.push(Span::styled(
                     if blink { "   ● REC " } else { "     REC " },
-                    Style::new().fg(Color::Red).bold(),
+                    Style::new().fg(t.err).bold(),
                 ));
                 spans.push(Span::raw(fmt_duration(clock.recorded())).bold());
             }
             State::Paused => {
                 spans.push(Span::styled(
                     "   ❚❚ PAUSED ",
-                    Style::new().fg(Color::Yellow).bold(),
+                    Style::new().fg(t.warn).bold(),
                 ));
                 spans.push(Span::raw(fmt_duration(clock.recorded())).bold());
             }
@@ -464,7 +539,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         }
     }
     if !app.saving.is_empty() {
-        spans.push(Span::raw("   saving…").fg(Color::Yellow));
+        spans.push(Span::raw("   saving…").fg(t.warn));
     }
     f.render_widget(Line::from(spans), tabs);
 
@@ -472,20 +547,44 @@ fn draw(f: &mut Frame, app: &mut App) {
         View::Record => draw_record(f, body, app),
         View::Recordings => app.library.draw(f, body),
     }
+    if app.confirm_discard
+        && let Some(live) = &app.live
+    {
+        let recorded = fmt_duration(live.take.clock.recorded());
+        input::draw_confirm(
+            f,
+            body,
+            "Discard recording?".into(),
+            vec![
+                Line::from(vec![
+                    Span::raw("Throw away this recording ("),
+                    Span::raw(recorded).bold(),
+                    Span::raw(") without saving it?"),
+                ]),
+                Line::from("It keeps recording until you answer. This can't be undone.").subtle(),
+            ],
+            Tone::Err,
+        );
+    }
     if let Some(ed) = &mut app.about_edit {
         input::draw_input(
             f,
             body,
             "About this recording".into(),
             vec![
-                Line::from("What is this recording about? Topic, people, key points…").dim(),
-                Line::from("Saved next to the recording when it's saved.").dim(),
+                Line::from("What is this recording about? Topic, people, key points…").subtle(),
+                Line::from("Saved next to the recording when it's saved.").subtle(),
             ],
             ed,
             8,
             browser::describe_hint(ed),
         );
     }
+}
+
+/// Paints the theme's background over the whole screen.
+pub fn fill_background(f: &mut Frame) {
+    f.render_widget(Block::new().style(theme::get().base()), f.area());
 }
 
 /// Like `ratatui::init`, plus bracketed paste (so pasted text arrives in one piece).
@@ -507,15 +606,16 @@ pub fn restore_terminal() {
 }
 
 fn draw_record(f: &mut Frame, area: Rect, app: &App) {
+    let t = theme::get();
     let Some(live) = &app.live else {
         let mut lines = vec![Line::from(Span::styled(
             format!(
                 "✗ Cannot open audio devices: {}",
                 app.open_error.as_deref().unwrap_or("?")
             ),
-            Style::new().fg(Color::Red),
+            Style::new().fg(t.err),
         ))];
-        lines.push(Line::from("Press Space to try again, Tab for recordings, q to quit.").dim());
+        lines.push(Line::from("Press Space to try again, Tab for recordings, q to quit.").subtle());
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
         return;
     };
@@ -531,20 +631,20 @@ fn draw_record(f: &mut Frame, area: Rect, app: &App) {
 
     let [header, system_area, mic_area, info, warn_area, footer] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(6),
-        Constraint::Length(6),
+        Constraint::Length(7),
+        Constraint::Length(7),
         Constraint::Length(5),
         Constraint::Min(0),
-        Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .areas(area);
 
     // ---- header ------------------------------------------------------------
     let blink = (clock.origin().elapsed().as_millis() / 600).is_multiple_of(2);
     let (icon, label, color) = match state {
-        State::Ready => (" ○ ", "READY ", Color::Yellow),
-        State::Recording => (if blink { " ● " } else { "   " }, "REC ", Color::Red),
-        State::Paused => (" ❚❚ ", "PAUSED ", Color::Yellow),
+        State::Ready => (" ○ ", "READY ", t.warn),
+        State::Recording => (if blink { " ● " } else { "   " }, "REC ", t.err),
+        State::Paused => (" ❚❚ ", "PAUSED ", t.warn),
     };
     let mut spans = vec![
         Span::styled(icon, Style::new().fg(color).bold()),
@@ -552,10 +652,8 @@ fn draw_record(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(fmt_duration(recorded), Style::new().bold()),
     ];
     match state {
-        State::Ready => {
-            spans.push(Span::raw("   press Space to start recording").fg(Color::Yellow))
-        }
-        State::Paused => spans.push(Span::raw("   press Space to resume").fg(Color::Yellow)),
+        State::Ready => spans.push(Span::raw("   press Space to start recording").fg(t.warn)),
+        State::Paused => spans.push(Span::raw("   press Space to resume").fg(t.warn)),
         State::Recording => {}
     }
     if let Some(l) = limit {
@@ -564,7 +662,7 @@ fn draw_record(f: &mut Frame, area: Rect, app: &App) {
                 "   auto-stop in {}",
                 fmt_duration(l.saturating_sub(recorded))
             ))
-            .dim(),
+            .subtle(),
         );
     }
     f.render_widget(Line::from(spans), header);
@@ -586,37 +684,33 @@ fn draw_record(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 "Saving to  "
             })
-            .dim(),
+            .subtle(),
             Span::raw(short_path(&output, info.width.saturating_sub(13) as usize)),
         ]),
         Line::from(vec![
-            Span::raw("Recorded   ").dim(),
+            Span::raw("Recorded   ").subtle(),
             Span::raw(fmt_bytes(bytes)),
-            Span::raw(" (raw tracks)").dim(),
+            Span::raw(" (raw tracks)").subtle(),
         ]),
         match app.about.lines().next() {
             Some(first) => Line::from(vec![
-                Span::raw("About      ").dim(),
-                Span::raw(first.to_string()).fg(Color::Cyan),
+                Span::raw("About      ").subtle(),
+                Span::raw(first.to_string()).fg(t.info),
                 Span::raw(if app.about.lines().count() > 1 {
                     " …"
                 } else {
                     ""
                 })
-                .dim(),
+                .subtle(),
             ]),
             None => Line::from(vec![
-                Span::raw("About      ").dim(),
-                Span::raw("press e to note what this recording is about").dim(),
+                Span::raw("About      ").subtle(),
+                Span::raw("press e to note what this recording is about").subtle(),
             ]),
         },
     ];
     f.render_widget(
-        Paragraph::new(info_text).block(
-            Block::bordered()
-                .border_type(BorderType::Rounded)
-                .title(" Recording "),
-        ),
+        Paragraph::new(info_text).block(theme::panel().title(" Recording ")),
         info,
     );
 
@@ -624,18 +718,13 @@ fn draw_record(f: &mut Frame, area: Rect, app: &App) {
     if !warnings.is_empty() {
         let lines: Vec<Line> = warnings
             .into_iter()
-            .map(|(color, text)| Line::from(Span::styled(text, Style::new().fg(color))))
+            .map(|(tone, text)| Line::from(Span::styled(text, Style::new().fg(tone.color()))))
             .collect();
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), warn_area);
     }
 
     // ---- footer ------------------------------------------------------------
-    let key = |k: &'static str| {
-        Span::styled(
-            format!(" {k} "),
-            Style::new().fg(Color::Black).bg(Color::Gray),
-        )
-    };
+    let key = browser::key_span;
     let toggle = match state {
         State::Ready => " start   ",
         State::Recording => " pause   ",
@@ -643,7 +732,12 @@ fn draw_record(f: &mut Frame, area: Rect, app: &App) {
     };
     let mut footer_spans = vec![key("space"), Span::raw(toggle)];
     if state != State::Ready {
-        footer_spans.extend([key("s"), Span::raw(" stop & save   ")]);
+        footer_spans.extend([
+            key("s"),
+            Span::raw(" stop & save   "),
+            key("x"),
+            Span::raw(" discard   "),
+        ]);
     }
     if let Some(m) = mic {
         footer_spans.push(key("m"));
@@ -658,6 +752,8 @@ fn draw_record(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(" about   "),
         key("tab"),
         Span::raw(" recordings   "),
+        key("t"),
+        Span::raw(" theme   "),
         key("q"),
         Span::raw(if state == State::Ready {
             " quit"
@@ -665,18 +761,22 @@ fn draw_record(f: &mut Frame, area: Rect, app: &App) {
             " save & quit"
         }),
     ]);
-    f.render_widget(Line::from(footer_spans), footer);
+    // Wraps onto a second line in narrow terminals.
+    f.render_widget(
+        Paragraph::new(Line::from(footer_spans)).wrap(Wrap { trim: true }),
+        footer,
+    );
 }
 
 fn draw_channel(f: &mut Frame, area: Rect, label: &str, ch: Option<&Channel>) {
+    let t = theme::get();
     let Some(ch) = ch else {
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().dim())
+        let block = theme::panel()
+            .border_style(Style::new().fg(t.off))
             .title(format!(" {label} · off "));
         f.render_widget(
             Paragraph::new("No microphone — recording system audio only")
-                .dim()
+                .subtle()
                 .block(block),
             area,
         );
@@ -689,63 +789,75 @@ fn draw_channel(f: &mut Frame, area: Rect, label: &str, ch: Option<&Channel>) {
         Span::raw(ch.name.clone()).bold(),
         Span::raw(" "),
     ];
-    if muted {
+    if ch.clipping() && !muted {
         title.push(Span::styled(
-            " MUTED ",
-            Style::new().fg(Color::White).bg(Color::Red).bold(),
+            " CLIP ",
+            Style::new().fg(t.on_color).bg(t.err).bold(),
         ));
         title.push(Span::raw(" "));
     }
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .title(Line::from(title));
+    if muted {
+        title.push(Span::styled(
+            " MUTED ",
+            Style::new().fg(t.on_color).bg(t.err).bold(),
+        ));
+        title.push(Span::raw(" "));
+    }
+    let block = theme::panel().title(Line::from(title));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let [gauge_area, spark_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+    let [meter_row, scale_row, hist_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(if inner.height >= 4 { 1 } else { 0 }),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
 
-    let color = if muted {
-        Color::DarkGray
-    } else {
-        level_color(ch.level)
-    };
-    f.render_widget(
-        Gauge::default()
-            .ratio(level_ratio(ch.level))
-            .label(db_label(ch.level))
-            .use_unicode(true)
-            .gauge_style(Style::new().fg(color).bg(Color::Black)),
-        gauge_area,
+    // Bar + current level, e.g. "███████▌    ▕   -18 dB".
+    let label = db_label(ch.level);
+    let label_w = label.chars().count() as u16 + 1;
+    let [bar_area, label_area] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(label_w)]).areas(meter_row);
+    let buf = f.buffer_mut();
+    meter::bar(
+        buf,
+        bar_area,
+        t,
+        level_ratio(ch.level),
+        level_ratio(ch.peak),
+        muted,
+    );
+    let label_color = if muted { t.off } else { level_color(ch.level) };
+    buf.set_string(
+        label_area.x + 1,
+        label_area.y,
+        label,
+        Style::new().fg(label_color).bold(),
+    );
+    meter::scale(
+        buf,
+        Rect {
+            width: bar_area.width,
+            ..scale_row
+        },
+        t.subtle().fg.unwrap_or(t.off),
     );
 
-    let width = spark_area.width as usize;
-    let data: Vec<u64> = ch
-        .hist
-        .iter()
-        .skip(ch.hist.len().saturating_sub(width))
-        .copied()
-        .collect();
-    f.render_widget(
-        Sparkline::default().data(data).max(100).style(
-            Style::new()
-                .fg(if muted { Color::DarkGray } else { Color::Cyan })
-                .add_modifier(Modifier::DIM),
-        ),
-        spark_area,
-    );
+    let data: Vec<u64> = ch.hist.iter().copied().collect();
+    meter::history(buf, hist_area, t, &data, muted);
 }
 
 fn collect_warnings(
     elapsed: Duration,
     system: &Channel,
     mic: Option<&Channel>,
-) -> Vec<(Color, String)> {
+) -> Vec<(Tone, String)> {
     let mut w = Vec::new();
     for (label, ch) in [("System audio", Some(system)), ("Microphone", mic)] {
         let Some(ch) = ch else { continue };
         if let Some(e) = ch.meter.error.lock().ok().and_then(|e| e.clone()) {
-            w.push((Color::Red, format!("✗ {label}: {e}")));
+            w.push((Tone::Err, format!("✗ {label}: {e}")));
         }
     }
     let silent_for = match system.last_sound {
@@ -762,7 +874,7 @@ fn collect_warnings(
             ""
         };
         w.push((
-            Color::Yellow,
+            Tone::Warn,
             format!("⚠ No system audio for {}.{hint}", fmt_duration(silent_for)),
         ));
     }
@@ -772,7 +884,7 @@ fn collect_warnings(
         && elapsed >= SILENT_WARN_AFTER
     {
         w.push((
-            Color::Yellow,
+            Tone::Warn,
             "⚠ Microphone has been silent since the start — check mic permission / device.".into(),
         ));
     }

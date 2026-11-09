@@ -7,8 +7,10 @@ use ratatui::{
     layout::{Constraint, Flex, Layout, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, BorderType, Clear, Paragraph, Wrap},
+    widgets::{Block, Clear, Paragraph, Wrap},
 };
+
+use crate::theme::{self, Themed, Tone};
 
 pub enum Action {
     None,
@@ -237,9 +239,9 @@ pub fn centered(area: Rect, w: u16, h: u16) -> Rect {
 }
 
 fn popup_block(title: String, color: Color) -> Block<'static> {
-    Block::bordered()
-        .border_type(BorderType::Rounded)
+    theme::panel()
         .border_style(Style::new().fg(color))
+        .style(theme::get().base())
         .title(Span::raw(format!(" {title} ")).bold())
 }
 
@@ -256,7 +258,7 @@ pub fn draw_input(
     let h = input_height + info.len() as u16 + 4;
     let popup = centered(area, 76, h);
     f.render_widget(Clear, popup);
-    let block = popup_block(title, Color::Cyan);
+    let block = popup_block(title, theme::get().accent);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
     let [info_area, input_area, _, hint_area] = Layout::vertical([
@@ -269,15 +271,17 @@ pub fn draw_input(
     f.render_widget(Paragraph::new(info).wrap(Wrap { trim: false }), info_area);
     let field = input_area;
     f.render_widget(
-        Block::new().style(Style::new().bg(Color::Rgb(40, 40, 48))),
+        Block::new().style(Style::new().bg(theme::get().field)),
         field,
     );
     input.render(f, field);
-    f.render_widget(hint.dim(), hint_area);
+    f.render_widget(hint.subtle(), hint_area);
 }
 
 /// Draws a yes/no confirmation dialog.
-pub fn draw_confirm(f: &mut Frame, area: Rect, title: String, body: Vec<Line>, color: Color) {
+pub fn draw_confirm(f: &mut Frame, area: Rect, title: String, body: Vec<Line>, tone: Tone) {
+    let t = theme::get();
+    let color = tone.color();
     let popup = centered(area, 76, body.len() as u16 + 4);
     f.render_widget(Clear, popup);
     let block = popup_block(title, color);
@@ -286,11 +290,11 @@ pub fn draw_confirm(f: &mut Frame, area: Rect, title: String, body: Vec<Line>, c
     let mut lines = body;
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
-        Span::styled(" y ", Style::new().fg(Color::Black).bg(color)),
+        Span::styled(" y ", Style::new().fg(t.on_color).bg(color)),
         Span::raw(" yes   "),
-        Span::styled(" n ", Style::new().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(" n ", t.key()),
         Span::raw(" / "),
-        Span::styled(" esc ", Style::new().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(" esc ", t.key()),
         Span::raw(" no"),
     ]));
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
