@@ -1,7 +1,7 @@
 # eavesdrop
 
 Records audio locally: **what plays on your computer** (system audio) plus **your microphone**,
-mixed into one WAV file. It captures audio at the OS level, so it works with any app that plays
+mixed into one compact Opus file (or WAV, if you prefer). It captures audio at the OS level, so it works with any app that plays
 sound, without integrating with it.
 
 > Recording laws differ by country/state. Some require consent from **everyone** who is recorded.
@@ -51,12 +51,13 @@ publishes a GitHub Release with the binaries.
 ## Use
 
 ```sh
-eavesdrop                        # open the app; Space starts → ~/Recordings/eavesdrop/eavesdrop_<date>.wav
+eavesdrop                        # open the app; Space starts → ~/Recordings/eavesdrop/eavesdrop_<date>.opus
 eavesdrop --now                  # start recording immediately
 eavesdrop --list                 # show devices
 eavesdrop --mic "AirPods"        # choose microphone (substring of name/id)
 eavesdrop --system "Headphones"  # choose output device to capture
 eavesdrop --no-mic               # only system audio, no microphone
+eavesdrop --format wav           # save uncompressed WAV instead of Opus
 eavesdrop --keep-tracks          # also keep separate system/mic WAVs
 eavesdrop --minutes 60           # auto-stop after 60 min of recorded time
 eavesdrop -o ~/Desktop           # output folder
@@ -64,7 +65,7 @@ eavesdrop --config ./my.toml     # use another config file
 eavesdrop --about "Podcast ep. 3" # note what the recording is about (saved next to it)
 eavesdrop --no-tui               # plain one-line output, records immediately (also used when piped)
 eavesdrop play                   # open only the player (doesn't open recording devices)
-eavesdrop play rec.wav           # … and play this file
+eavesdrop play rec.opus          # … and play this file (.opus or .wav)
 eavesdrop recordings             # print the list of recordings: date, length, size, file, about
 ```
 
@@ -100,7 +101,7 @@ selected: press Tab, then Enter, to listen to it. `--minutes` stops & saves the 
 
 ### ♫ Recordings
 
-The list shows the WAV files in the recordings folder, newest first, with the first line of
+The list shows the recordings (`.opus` and `.wav` files) in the recordings folder, newest first, with the first line of
 each description. The details card on the right (below the list in a narrow terminal) shows
 the selected recording's date, length, size and full description. The player sits at the
 bottom and plays through the system default output device.
@@ -137,7 +138,7 @@ delete offers to remove the file permanently instead.
 A description lives in a small text file next to the recording, with the same name:
 
 ```
-eavesdrop_2026-11-08_10-00-00.wav
+eavesdrop_2026-11-08_10-00-00.opus
 eavesdrop_2026-11-08_10-00-00.meta.toml
 ```
 
@@ -147,8 +148,18 @@ Ideas for the onboarding redesign
 Try the shorter sign-up flow first"""
 ```
 
-The WAV file itself is never modified. You can edit, grep or sync the `.meta.toml` files with
+The audio file itself is never modified. You can edit, grep or sync the `.meta.toml` files with
 other tools. Renaming or deleting a recording in the app does the same to its description.
+
+### File format
+
+Recordings are saved as **Opus** (`.opus`): mono, 48 kHz, 32 kb/s. That is about **14 MB per
+hour**, against ~690 MB for a 48 kHz stereo 16-bit WAV, and speech sounds the same. Opus is
+what Zoom, Teams, Meet and WebRTC use for calls; `.opus` files play in VLC, browsers, ffmpeg and
+most modern players.
+
+For lossless files, set `format = "wav"` in the config or pass `--format wav`. The app lists and
+plays both kinds. The separate tracks from `--keep-tracks` are always raw WAV.
 
 Paused time is cut out of the file (not filled with silence); system audio and mic stay in sync.
 
@@ -163,6 +174,9 @@ output_dir = "~/Documents/Recordings"
 
 # Color theme (see below).
 theme = "catppuccin-mocha"
+
+# File format of new recordings: "opus" (default, ~14 MB/hour) or "wav" (lossless, large).
+format = "opus"
 ```
 
 `--out` overrides `output_dir`. If neither is set, recordings go to `~/Recordings/eavesdrop`.

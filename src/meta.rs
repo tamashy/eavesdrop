@@ -1,5 +1,5 @@
 //! Per-recording metadata, kept in a small TOML file next to the recording:
-//! `eavesdrop_2026-11-08_10-00-00.wav` → `eavesdrop_2026-11-08_10-00-00.meta.toml`.
+//! `eavesdrop_2026-11-08_10-00-00.opus` → `eavesdrop_2026-11-08_10-00-00.meta.toml`.
 //!
 //! ```toml
 //! description = """
@@ -7,7 +7,7 @@
 //! Try the shorter sign-up flow first."""
 //! ```
 //!
-//! A sidecar file (instead of tags inside the WAV) keeps the recording untouched
+//! A sidecar file (instead of tags inside the audio file) keeps the recording untouched
 //! and is easy to read, edit, grep or sync with other tools.
 
 use std::path::{Path, PathBuf};

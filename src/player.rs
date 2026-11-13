@@ -1,4 +1,4 @@
-//! WAV playback through the default output device, with pause, seek and volume.
+//! WAV / Opus playback through the default output device, with pause, seek and volume.
 //!
 //! A decoder thread reads the file, converts it to stereo at the device rate
 //! and keeps ~0.5 s queued; the audio callback only pops frames from that queue.
@@ -17,6 +17,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+
+use crate::opus;
 use cpal::{
     FromSample, SampleFormat, SizedSample, Stream,
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -24,6 +26,55 @@ use cpal::{
 
 type Frame = [f32; 2];
 type Reader = hound::WavReader<BufReader<File>>;
+
+/// A decodable recording.
+enum Source {
+    Wav(Reader),
+    Opus(Box<opus::Reader>),
+}
+
+impl Source {
+    fn open(path: &Path) -> Result<Self> {
+        if opus::is_opus(path) {
+            return Ok(Source::Opus(Box::new(opus::Reader::open(path)?)));
+        }
+        let reader = hound::WavReader::open(path)?;
+        let spec = reader.spec();
+        if spec.channels == 0 || spec.sample_rate == 0 {
+            bail!("invalid WAV header");
+        }
+        Ok(Source::Wav(reader))
+    }
+
+    fn rate(&self) -> u32 {
+        match self {
+            Source::Wav(r) => r.spec().sample_rate,
+            Source::Opus(_) => opus::RATE,
+        }
+    }
+
+    fn frames(&self) -> u64 {
+        match self {
+            Source::Wav(r) => r.duration().into(),
+            Source::Opus(r) => r.frames(),
+        }
+    }
+
+    fn seek(&mut self, frame: u64) -> Result<()> {
+        match self {
+            Source::Wav(r) => Ok(r.seek(frame.min(u32::MAX.into()) as u32)?),
+            Source::Opus(r) => r.seek(frame),
+        }
+    }
+
+    /// Reads up to `n` frames as stereo f32.
+    fn read(&mut self, n: usize, out: &mut Vec<Frame>) -> Result<()> {
+        match self {
+            Source::Wav(r) => read_frames(r, n, out),
+            Source::Opus(r) => r.read(n, out),
+        }
+    }
+}
 
 /// Source frames decoded per step.
 const CHUNK: usize = 2048;
@@ -34,7 +85,7 @@ struct Queue {
     /// Position (in source frames) of the first queued frame.
     head: f64,
     /// Pending seek target (source frames) for the decoder.
-    seek: Option<u32>,
+    seek: Option<u64>,
     /// Decoder reached the end of the file.
     eof: bool,
 }
@@ -50,7 +101,7 @@ struct Shared {
 pub struct Player {
     shared: Arc<Shared>,
     rate: u32,
-    frames: u32,
+    frames: u64,
     _stream: Stream,
     decoder: Option<JoinHandle<()>>,
 }
@@ -58,13 +109,9 @@ pub struct Player {
 impl Player {
     /// Opens `path` and starts playing it.
     pub fn open(path: &Path, volume: f32) -> Result<Self> {
-        let reader = hound::WavReader::open(path)
-            .with_context(|| format!("cannot open {}", path.display()))?;
-        let spec = reader.spec();
-        if spec.channels == 0 || spec.sample_rate == 0 {
-            bail!("invalid WAV header");
-        }
-        let frames = reader.duration();
+        let reader =
+            Source::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+        let (rate, frames) = (reader.rate(), reader.frames());
 
         let host = cpal::default_host();
         let dev = host
@@ -72,7 +119,7 @@ impl Player {
             .ok_or_else(|| anyhow!("no default output device"))?;
         let cfg = dev.default_output_config()?;
         let dev_rate = cfg.sample_rate();
-        let step = spec.sample_rate as f64 / dev_rate as f64;
+        let step = rate as f64 / dev_rate as f64;
 
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
@@ -115,7 +162,7 @@ impl Player {
 
         Ok(Self {
             shared,
-            rate: spec.sample_rate,
+            rate,
             frames,
             _stream: stream,
             decoder: Some(decoder),
@@ -159,7 +206,7 @@ impl Player {
     }
 
     pub fn seek(&self, to: Duration) {
-        let frame = ((to.as_secs_f64() * self.rate as f64) as u64).min(self.frames as u64) as u32;
+        let frame = ((to.as_secs_f64() * self.rate as f64) as u64).min(self.frames);
         let mut q = self.queue();
         q.frames.clear();
         q.head = frame as f64;
@@ -206,7 +253,7 @@ impl Drop for Player {
 // Decoder thread
 // ---------------------------------------------------------------------------
 
-fn decode(mut reader: Reader, shared: Arc<Shared>, step: f64, target: usize) {
+fn decode(mut reader: Source, shared: Arc<Shared>, step: f64, target: usize) {
     let set_error = |e: String| {
         if let Ok(mut slot) = shared.error.lock() {
             *slot = Some(e);
@@ -233,7 +280,7 @@ fn decode(mut reader: Reader, shared: Arc<Shared>, step: f64, target: usize) {
 
         src.clear();
         out.clear();
-        let eof = match read_frames(&mut reader, CHUNK, &mut src) {
+        let eof = match reader.read(CHUNK, &mut src) {
             Ok(()) => src.len() < CHUNK,
             Err(e) => {
                 set_error(format!("read failed: {e}"));

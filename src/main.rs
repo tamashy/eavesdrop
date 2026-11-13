@@ -1,5 +1,5 @@
 //! eavesdrop — record audio locally: what plays on the computer (system audio)
-//! plus your microphone, mixed into one WAV file.
+//! plus your microphone, mixed into one Opus (or WAV) file.
 //!
 //! It captures the system's audio output via OS loopback, so it works with any
 //! app that plays sound, without integrating with it.
@@ -15,6 +15,7 @@ mod input;
 mod library;
 mod meta;
 mod meter;
+mod opus;
 mod player;
 mod record;
 mod theme;
@@ -111,7 +112,11 @@ struct Opt {
     #[arg(long, default_value_t = 1.0)]
     mic_gain: f32,
 
-    /// Also keep the separate system / mic tracks next to the mixed file
+    /// File format of the recording (default: `format` from the config file, else opus)
+    #[arg(long, value_enum, global = true)]
+    format: Option<config::Format>,
+
+    /// Also keep the separate system / mic tracks (WAV) next to the mixed file
     #[arg(long)]
     keep_tracks: bool,
 
@@ -299,6 +304,7 @@ fn run() -> Result<()> {
         out_dir,
         mic_gain: opt.mic_gain,
         keep_tracks: opt.keep_tracks,
+        format: opt.format.or(cfg.format).unwrap_or_default(),
     };
 
     let (stop_tx, stop_rx) = mpsc::channel();
@@ -637,7 +643,7 @@ where
 }
 
 // ===========================================================================
-// Mixdown: system + mic → one stereo 16-bit WAV (streaming, low memory)
+// Mixdown: system + mic → one mono Opus / stereo 16-bit WAV (streaming, low memory)
 // ===========================================================================
 
 /// Streams a WAV file as stereo frames, resampled to `out_rate` (linear interp).
@@ -705,20 +711,72 @@ impl Source {
     }
 }
 
-fn mixdown(system: &Path, mic: Option<&Path>, mic_gain: f32, out: &Path) -> Result<()> {
-    let out_rate = hound::WavReader::open(system)?.spec().sample_rate;
+/// The mixed recording being written.
+enum Sink {
+    Wav(hound::WavWriter<std::io::BufWriter<File>>),
+    Opus(Box<opus::Writer>),
+}
+
+impl Sink {
+    fn create(path: &Path, format: config::Format, rate: u32) -> Result<Self> {
+        Ok(match format {
+            config::Format::Wav => Sink::Wav(hound::WavWriter::create(
+                path,
+                hound::WavSpec {
+                    channels: 2,
+                    sample_rate: rate,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                },
+            )?),
+            config::Format::Opus => Sink::Opus(Box::new(opus::Writer::create(path)?)),
+        })
+    }
+
+    /// Output sample rate: the system track's for WAV, Opus's own otherwise.
+    fn rate(format: config::Format, system_rate: u32) -> u32 {
+        match format {
+            config::Format::Wav => system_rate,
+            config::Format::Opus => opus::RATE,
+        }
+    }
+
+    fn write(&mut self, f: [f32; 2]) -> Result<()> {
+        match self {
+            Sink::Wav(w) => {
+                for x in f {
+                    w.write_sample((x * i16::MAX as f32) as i16)?;
+                }
+            }
+            // Calls don't need stereo: mono halves the bitrate needed for the same quality.
+            Sink::Opus(w) => w.write((f[0] + f[1]) * 0.5)?,
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<()> {
+        match self {
+            Sink::Wav(w) => w.finalize()?,
+            Sink::Opus(w) => w.finish()?,
+        }
+        Ok(())
+    }
+}
+
+fn mixdown(
+    system: &Path,
+    mic: Option<&Path>,
+    mic_gain: f32,
+    out: &Path,
+    format: config::Format,
+) -> Result<()> {
+    let out_rate = Sink::rate(format, hound::WavReader::open(system)?.spec().sample_rate);
     let mut a = Source::open(system, out_rate)?;
     let mut b = match mic {
         Some(p) => Some(Source::open(p, out_rate)?),
         None => None,
     };
-    let spec = hound::WavSpec {
-        channels: 2,
-        sample_rate: out_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut w = hound::WavWriter::create(out, spec)?;
+    let mut sink = Sink::create(out, format, out_rate)?;
     loop {
         let fa = a.next_frame();
         let fb = b.as_mut().and_then(|s| s.next_frame());
@@ -727,6 +785,7 @@ fn mixdown(system: &Path, mic: Option<&Path>, mic_gain: f32, out: &Path) -> Resu
         }
         let fa = fa.unwrap_or([0.0; 2]);
         let fb = fb.unwrap_or([0.0; 2]);
+        let mut frame = [0f32; 2];
         for c in 0..2 {
             let x = fa[c] + fb[c] * mic_gain;
             let x = if x.abs() > 0.9 {
@@ -734,9 +793,52 @@ fn mixdown(system: &Path, mic: Option<&Path>, mic_gain: f32, out: &Path) -> Resu
             } else {
                 x
             };
-            w.write_sample((x.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
+            frame[c] = x.clamp(-1.0, 1.0);
         }
+        sink.write(frame)?;
     }
-    w.finalize()?;
-    Ok(())
+    sink.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixdown_to_opus_keeps_length() {
+        let dir = std::env::temp_dir().join(format!("eavesdrop-mix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 2 s of stereo float at 44.1 kHz (resampled to 48 kHz for Opus) + 1 s mono mic.
+        let track = |name: &str, channels: u16, rate: u32, secs: u32| {
+            let path = dir.join(name);
+            let spec = hound::WavSpec {
+                channels,
+                sample_rate: rate,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            let mut w = hound::WavWriter::create(&path, spec).unwrap();
+            for i in 0..rate * secs * channels as u32 {
+                w.write_sample((i as f32 * 0.01).sin() * 0.3).unwrap();
+            }
+            w.finalize().unwrap();
+            path
+        };
+        let system = track("system.wav", 2, 44_100, 2);
+        let mic = track("mic.wav", 1, 16_000, 1);
+
+        let out = dir.join("mix.opus");
+        mixdown(&system, Some(&mic), 1.0, &out, config::Format::Opus).unwrap();
+        let d = opus::duration(&out).unwrap().as_secs_f64();
+        assert!((d - 2.0).abs() < 0.001, "duration {d}");
+
+        let wav = dir.join("mix.wav");
+        mixdown(&system, Some(&mic), 1.0, &wav, config::Format::Wav).unwrap();
+        let spec = hound::WavReader::open(&wav).unwrap().spec();
+        assert_eq!((spec.channels, spec.sample_rate), (2, 44_100));
+        assert!(
+            std::fs::metadata(&out).unwrap().len() * 20 < std::fs::metadata(&wav).unwrap().len()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

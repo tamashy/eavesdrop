@@ -18,7 +18,7 @@ use std::{
 use anyhow::{Context, Result};
 use cpal::{Device, SupportedStreamConfig};
 
-use crate::{Meter, Track, clock::Clock, dev_name, mixdown, start_track};
+use crate::{Meter, Track, clock::Clock, config::Format, dev_name, mixdown, start_track};
 
 pub struct Input {
     dev: Device,
@@ -39,6 +39,7 @@ pub struct Recorder {
     pub out_dir: PathBuf,
     pub mic_gain: f32,
     pub keep_tracks: bool,
+    pub format: Format,
 }
 
 pub struct Take {
@@ -51,6 +52,7 @@ pub struct Take {
     out_dir: PathBuf,
     mic_gain: f32,
     keep_tracks: bool,
+    format: Format,
 }
 
 pub enum Outcome {
@@ -130,6 +132,7 @@ impl Recorder {
             out_dir: self.out_dir.clone(),
             mic_gain: self.mic_gain,
             keep_tracks: self.keep_tracks,
+            format: self.format,
         })
     }
 }
@@ -144,8 +147,11 @@ impl Take {
             }
             None => chrono::Local::now(),
         };
-        self.out_dir
-            .join(format!("eavesdrop_{}.wav", at.format("%Y-%m-%d_%H-%M-%S")))
+        self.out_dir.join(format!(
+            "eavesdrop_{}.{}",
+            at.format("%Y-%m-%d_%H-%M-%S"),
+            self.format.extension()
+        ))
     }
 
     /// Stops capturing now; the file is finished on a background thread.
@@ -172,7 +178,7 @@ impl Take {
         let system = self.system_track.stop();
         let mic = self.mic_track.map(Track::stop);
         let (work_dir, out_dir) = (self.work_dir, self.out_dir);
-        let (mic_gain, keep_tracks) = (self.mic_gain, self.keep_tracks);
+        let (mic_gain, keep_tracks, format) = (self.mic_gain, self.keep_tracks, self.format);
         std::thread::spawn(move || {
             let join = |h: JoinHandle<Result<f32>>| {
                 h.join()
@@ -193,7 +199,7 @@ impl Take {
             let system_path = work_dir.join("system.wav");
             let mic_path = work_dir.join("mic.wav");
             let mic_input = mic_peak.map(|_| mic_path.as_path());
-            mixdown(&system_path, mic_input, mic_gain, &path).with_context(|| {
+            mixdown(&system_path, mic_input, mic_gain, &path, format).with_context(|| {
                 format!("mixdown failed; raw tracks kept in {}", work_dir.display())
             })?;
 
@@ -255,9 +261,14 @@ fn unique(path: PathBuf) -> PathBuf {
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
+    let ext = path
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
     let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     (2..)
-        .map(|n| dir.join(format!("{stem}_{n}.wav")))
+        .map(|n| dir.join(format!("{stem}_{n}.{ext}")))
         .find(|p| !p.exists())
         .unwrap_or(path)
 }
