@@ -10,6 +10,9 @@
 //!
 //! # Color theme: default, catppuccin-mocha, catppuccin-latte, nord, … (see `theme`).
 //! theme = "catppuccin-mocha"
+//!
+//! # File format of new recordings: "opus" (compact, the default) or "wav" (lossless).
+//! format = "opus"
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -24,6 +27,28 @@ pub struct Config {
     pub output_dir: Option<PathBuf>,
     /// Color theme name.
     pub theme: Option<String>,
+    /// File format of new recordings.
+    pub format: Option<Format>,
+}
+
+/// File format recordings are saved in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Format {
+    /// Ogg Opus, mono 32 kb/s: ~14 MB per hour
+    #[default]
+    Opus,
+    /// Uncompressed 16-bit stereo: ~690 MB per hour at 48 kHz
+    Wav,
+}
+
+impl Format {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Format::Opus => "opus",
+            Format::Wav => "wav",
+        }
+    }
 }
 
 impl Config {
@@ -108,6 +133,14 @@ mod tests {
         let cfg = Config::parse(r#"theme = "catppuccin-latte""#).unwrap();
         assert_eq!(cfg.theme.as_deref(), Some("catppuccin-latte"));
         assert!(Config::parse(r#"theme = "neon""#).is_err());
+    }
+
+    #[test]
+    fn format_parses() {
+        assert_eq!(Config::parse("").unwrap().format, None);
+        let cfg = Config::parse(r#"format = "wav""#).unwrap();
+        assert_eq!(cfg.format, Some(Format::Wav));
+        assert!(Config::parse(r#"format = "mp3""#).is_err());
     }
 
     #[test]

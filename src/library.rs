@@ -7,14 +7,25 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use crate::meta;
+use crate::{meta, opus};
+
+/// File extensions listed as recordings.
+const EXTENSIONS: &[&str] = &["opus", "wav"];
+
+fn is_recording(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| EXTENSIONS.iter().any(|e| x.eq_ignore_ascii_case(e)))
+}
 
 pub struct Recording {
     pub path: PathBuf,
     pub name: String,
     pub modified: Option<SystemTime>,
     pub size: u64,
-    /// None if the WAV header can't be read (e.g. still being written).
+    /// None if the file can't be read (e.g. still being written).
     pub duration: Option<Duration>,
     /// What the recording is about (from its `.meta.toml`), empty if none.
     pub description: String,
@@ -27,7 +38,7 @@ impl Recording {
     }
 }
 
-/// WAV files directly in `dir`, newest first. A missing folder yields an empty list.
+/// Recordings (`.opus`, `.wav`) directly in `dir`, newest first. A missing folder yields an empty list.
 pub fn scan(dir: &Path) -> Result<Vec<Recording>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -36,10 +47,7 @@ pub fn scan(dir: &Path) -> Result<Vec<Recording>> {
     };
     let mut recs: Vec<Recording> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            let p = e.path();
-            p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("wav"))
-        })
+        .filter(|e| is_recording(&e.path()))
         .map(|e| {
             let path = e.path();
             let meta = e.metadata().ok();
@@ -51,7 +59,7 @@ pub fn scan(dir: &Path) -> Result<Vec<Recording>> {
                     .into(),
                 modified: meta.as_ref().and_then(|m| m.modified().ok()),
                 size: meta.map(|m| m.len()).unwrap_or(0),
-                duration: wav_duration(&path),
+                duration: duration(&path),
                 description: meta::load(&path).map(|m| m.description).unwrap_or_default(),
                 path,
             }
@@ -65,7 +73,10 @@ pub fn scan(dir: &Path) -> Result<Vec<Recording>> {
     Ok(recs)
 }
 
-fn wav_duration(path: &Path) -> Option<Duration> {
+fn duration(path: &Path) -> Option<Duration> {
+    if opus::is_opus(path) {
+        return opus::duration(path);
+    }
     let r = hound::WavReader::open(path).ok()?;
     let rate = r.spec().sample_rate;
     (rate > 0).then(|| Duration::from_secs_f64(r.duration() as f64 / rate as f64))
@@ -74,15 +85,19 @@ fn wav_duration(path: &Path) -> Option<Duration> {
 /// Characters not allowed in file names on at least one supported OS.
 const FORBIDDEN: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
 
-/// Checks a new name typed by the user; returns it trimmed and without `.wav`.
+/// Checks a new name typed by the user; returns it trimmed and without a
+/// recording extension (`.opus`, `.wav`).
 pub fn validate_name(name: &str) -> Result<String> {
     let name = name.trim();
-    let name = match name.len().checked_sub(4) {
-        Some(i) if name.is_char_boundary(i) && name[i..].eq_ignore_ascii_case(".wav") => {
-            name[..i].trim_end()
-        }
-        _ => name,
-    };
+    let name = EXTENSIONS
+        .iter()
+        .find_map(|ext| {
+            let i = name.len().checked_sub(ext.len() + 1)?;
+            let tail = name.get(i..)?;
+            (tail.starts_with('.') && tail[1..].eq_ignore_ascii_case(ext))
+                .then(|| name[..i].trim_end())
+        })
+        .unwrap_or(name);
     if name.is_empty() {
         bail!("name can't be empty");
     }
@@ -98,17 +113,20 @@ pub fn validate_name(name: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
-/// Renames a recording (and its metadata file) within its folder. Returns the new path.
+/// Renames a recording (and its metadata file) within its folder, keeping its
+/// extension. Returns the new path.
 pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf> {
     let name = validate_name(new_name)?;
-    let dest = path.with_file_name(format!("{name}.wav"));
+    let ext = path.extension().unwrap_or_default().to_string_lossy();
+    let file = format!("{name}.{ext}");
+    let dest = path.with_file_name(&file);
     if dest == path {
         return Ok(dest);
     }
     // On case-insensitive file systems a case-only rename "exists" already.
     let same_file = dest.to_string_lossy().to_lowercase() == path.to_string_lossy().to_lowercase();
     if dest.exists() && !same_file {
-        bail!("{name}.wav already exists");
+        bail!("{file} already exists");
     }
     std::fs::rename(path, &dest).with_context(|| format!("cannot rename to {}", dest.display()))?;
     let (old_meta, new_meta) = (meta::path_for(path), meta::path_for(&dest));
@@ -180,12 +198,14 @@ mod tests {
             validate_name("  Standup 2026.WAV ").unwrap(),
             "Standup 2026"
         );
+        assert_eq!(validate_name("call.opus").unwrap(), "call");
+        assert_eq!(validate_name("a.b").unwrap(), "a.b");
         assert_eq!(
             validate_name("Встреча с командой").unwrap(),
             "Встреча с командой"
         );
         for bad in [
-            "", "  ", ".wav", "a/b", "a\\b", "x:y", "q?", ".hidden", "end.",
+            "", "  ", ".wav", ".OPUS", "a/b", "a\\b", "x:y", "q?", ".hidden", "end.",
         ] {
             assert!(validate_name(bad).is_err(), "{bad:?} should be rejected");
         }
@@ -207,13 +227,17 @@ mod tests {
         assert_eq!(meta::load(&b).unwrap().description, "about a");
         assert!(!meta::path_for(&a).exists());
 
+        let c = dir.join("c.opus");
+        std::fs::write(&c, b"z").unwrap();
+        assert_eq!(rename(&c, "Call").unwrap(), dir.join("Call.opus"));
+
         delete(&b).unwrap();
         assert!(!b.exists() && !meta::path_for(&b).exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn lists_only_wav_with_duration() {
+    fn lists_only_recordings_with_duration() {
         let dir = std::env::temp_dir().join(format!("eavesdrop-lib-{}", std::process::id()));
         std::fs::create_dir_all(dir.join(".tmp-x")).unwrap();
         std::fs::write(dir.join("notes.txt"), "x").unwrap();
@@ -228,15 +252,29 @@ mod tests {
             w.write_sample(0i16).unwrap();
         }
         w.finalize().unwrap();
+        let mut o = opus::Writer::create(&dir.join("b.opus")).unwrap();
+        for _ in 0..opus::RATE / 2 {
+            o.write(0.0).unwrap();
+        }
+        o.finish().unwrap();
+        // Make the WAV the newest so the order is deterministic.
+        let f = std::fs::File::options()
+            .append(true)
+            .open(dir.join("a.wav"))
+            .unwrap();
+        f.set_modified(SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
 
         let recs = scan(&dir).unwrap();
-        assert_eq!(recs.len(), 1);
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[1].name, "b.opus");
+        assert_eq!(recs[1].duration, Some(Duration::from_millis(500)));
         assert_eq!(recs[0].name, "a.wav");
         assert_eq!(recs[0].duration, Some(Duration::from_millis(2500)));
         assert_eq!(recs[0].description, "");
         meta::set_description(&dir.join("a.wav"), "Line one\nline two").unwrap();
         let recs = scan(&dir).unwrap();
-        assert_eq!(recs.len(), 1, "metadata file must not be listed");
+        assert_eq!(recs.len(), 2, "metadata file must not be listed");
         assert_eq!(recs[0].summary(), "Line one");
         std::fs::remove_dir_all(&dir).ok();
     }

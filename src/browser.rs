@@ -783,7 +783,7 @@ fn draw_dialog(f: &mut Frame, app: &mut Library, area: Rect) {
                 key_span("enter"),
                 Span::raw(" rename   "),
                 key_span("esc"),
-                Span::raw(" cancel   .wav is added automatically"),
+                Span::raw(" cancel   the extension is kept"),
             ]);
             input::draw_input(f, area, "Rename recording".into(), info, input, 1, hint);
         }

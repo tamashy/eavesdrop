@@ -145,7 +145,7 @@ fn level_color(p: f32) -> Color {
     }
 }
 
-/// "~/…/eavesdrop/eavesdrop_2026-11-05.wav" — home shortened, middle elided to fit `max` chars.
+/// "~/…/eavesdrop/eavesdrop_2026-11-05.opus" — home shortened, middle elided to fit `max` chars.
 pub fn short_path(p: &Path, max: usize) -> String {
     let mut s = p.display().to_string();
     if let Some(home) = dirs::home_dir().map(|h| h.display().to_string())
